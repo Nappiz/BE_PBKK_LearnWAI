@@ -16,33 +16,49 @@ except Exception:
     from pypdf import PdfReader
     HAS_FITZ = False
 
-# ----- ENV & Supabase client -----
+# ===== ENV & Supabase client =====
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# ===== FastAPI & CORS =====
 app = FastAPI(title="LearnWAI API")
+
+# FE origin production (set di env BE: FRONTEND_ORIGIN=https://learnwaidev.vercel.app)
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://learnwaidev.vercel.app")
+
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    FRONTEND_ORIGIN,
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000","http://127.0.0.1:3000","*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --------- MODELS ----------
+app.router.redirect_slashes = False
+
+
+# ===== Pydantic models =====
 class RegisterIn(BaseModel):
     name: str
     email: EmailStr
     password: str
 
+
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
+
 
 class UserOut(BaseModel):
     id: str
@@ -50,15 +66,17 @@ class UserOut(BaseModel):
     email: EmailStr
     created_at: str | None = None
 
-# --------- AUTH ----------
-@app.post("/auth/register", response_model=dict)
+
+# ===== AUTH =====
+@app.post("/auth/register")
+@app.post("/auth/register/")
 def auth_register(req: RegisterIn):
-    # already exists?
     sel = supabase.table("users").select("*").eq("email", req.email).limit(1).execute()
     if sel.data:
         raise HTTPException(status_code=409, detail="Email already registered")
 
     pw_hash = bcrypt.hashpw(req.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
     ins = supabase.table("users").insert({
         "id": str(uuid4()),
         "name": req.name,
@@ -66,17 +84,21 @@ def auth_register(req: RegisterIn):
         "password_hash": pw_hash,
         "created_at": datetime.utcnow().isoformat(),
     }).execute()
+
     if not ins.data:
         raise HTTPException(status_code=500, detail="Failed to create user")
 
     u = ins.data[0]
     return {"user": {"id": u["id"], "name": u["name"], "email": u["email"], "created_at": u.get("created_at")}}
 
-@app.post("/auth/login", response_model=dict)
+
+@app.post("/auth/login")
+@app.post("/auth/login/")  
 def auth_login(req: LoginIn):
     sel = supabase.table("users").select("*").eq("email", req.email).limit(1).execute()
     if not sel.data:
         raise HTTPException(status_code=401, detail="Invalid email or password")
+
     u = sel.data[0]
     pw_hash = u.get("password_hash")
     if not pw_hash or not bcrypt.checkpw(req.password.encode("utf-8"), pw_hash.encode("utf-8")):
@@ -84,13 +106,16 @@ def auth_login(req: LoginIn):
 
     return {"user": {"id": u["id"], "name": u["name"], "email": u["email"], "created_at": u.get("created_at")}}
 
-# --------- UPLOAD ----------
+
+# ===== UPLOAD =====
 @app.post("/upload")
+@app.post("/upload/")  
 async def upload_document(file: UploadFile = File(...), user_id: str | None = None):
     if file.content_type != "application/pdf":
         raise HTTPException(status_code=400, detail="Only PDF is allowed")
 
     file_bytes = await file.read()
+
     user_folder = user_id or "anonymous"
     file_path = f"{user_folder}/{uuid4()}.pdf"
 
@@ -98,9 +123,11 @@ async def upload_document(file: UploadFile = File(...), user_id: str | None = No
         file_path, file_bytes, {"content-type": "application/pdf"}
     )
     if isinstance(res, dict) and res.get("error"):
-        raise HTTPException(500, str(res["error"]))
+        raise HTTPException(status_code=500, detail=str(res["error"]))
+
     public_url = supabase.storage.from_("documents").get_public_url(file_path)
 
+    # Metadata PDF
     try:
         if HAS_FITZ:
             import fitz  # type: ignore
