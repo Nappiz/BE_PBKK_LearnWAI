@@ -8,6 +8,7 @@ from datetime import datetime
 import os
 import bcrypt
 from io import BytesIO
+import httpx
 
 try:
     import fitz  # PyMuPDF
@@ -66,6 +67,10 @@ class UserOut(BaseModel):
     email: EmailStr
     created_at: str | None = None
 
+class AIResultIn(BaseModel):
+    document_id: str
+    status: str
+    result: dict
 
 # ===== AUTH =====
 @app.post("/auth/register")
@@ -106,6 +111,24 @@ def auth_login(req: LoginIn):
 
     return {"user": {"id": u["id"], "name": u["name"], "email": u["email"], "created_at": u.get("created_at")}}
 
+# ===== AI PROCESS =====
+async def trigger_ai_processing(document_id: str, file_url: str):
+    AI_SERVICE_URL = os.getenv("AI_SERVICE_URL")
+    if not AI_SERVICE_URL:
+            print(f"ERROR: AI_SERVICE_URL NOT SET")
+            return
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            print(f"Triggerring AI service for document {document_id}")
+            await client.post(
+                f"{AI_SERVICE_URL}/api/process-from-url",
+                json{"document_id": document_id, "file_url": file_url}
+                timeout=60.0
+            )
+        except httpx.RequestError as e: 
+            print(f"Error calling AI service: {e}")
+            supabase.table ("documents").update({"status": "processing failed"})
 
 # ===== UPLOAD =====
 @app.post("/upload")
@@ -147,4 +170,25 @@ async def upload_document(file: UploadFile = File(...), user_id: str | None = No
         "user_id": user_id,
     }).execute()
 
+    background_tasks.add_task(trigger_ai_processing, document_id, public_url)
+
     return {"message": "Upload success", "data": ins.data}
+
+@app.patch("/documents/update-from-ai")
+@app.patch("/documents/update-from-ai/")
+def update_document_from_ai(req: AIResultIn):
+    
+    try:
+        update_data = {
+            "status": req.status,
+            "ai_result": req.result,
+            "processed_at": datetime.utcnow().isoformat()
+        }
+        res = supabase.table("documents").update(update_data).eq("id", req.document_id).execute()
+        
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Document not found")
+        return {"message": "Document updated by AI successfully"}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
