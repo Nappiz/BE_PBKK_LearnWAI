@@ -40,3 +40,12 @@ pypdf
 passlib
 bcrypt
 pymupdf
+numpy==1.26.4
+scikit-learn==1.5.2
+sentence-transformers==3.1.1
+ragas==0.1.14
+datasets==2.20.0
+pandas==2.2.2
+pyarrow==21.0.0
+tenacity==8.5.0
+PyPDF2==3.0.1
