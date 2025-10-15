@@ -39,21 +39,27 @@ if not SUPABASE_URL or not (SUPABASE_SERVICE_KEY or SUPABASE_KEY):
 _EFF_KEY = SUPABASE_SERVICE_KEY or SUPABASE_KEY
 supabase: Client = create_client(SUPABASE_URL, _EFF_KEY)  
 
-CORS_ORIGIN = os.getenv("CORS_ORIGIN", "http://localhost:3000")
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "").strip()
+DEFAULT_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$|^https://.*\.vercel\.app$"
+CORS_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", DEFAULT_REGEX)
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 MIN_CHARS_PER_CHUNK = int(os.getenv("MIN_CHARS_PER_CHUNK", "300"))
 
+origins = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
 logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="LearnWAI RAG App", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[CORS_ORIGIN] if CORS_ORIGIN else ["*"],
+    allow_origins=origins if origins else [],
+    allow_origin_regex=None if origins else CORS_ORIGIN_REGEX,  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,
 )
 
 # ======== auth payloads ========
