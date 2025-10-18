@@ -1,23 +1,41 @@
 import os, shutil, json, numpy as np
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import normalize
 import httpx
 from fastapi import HTTPException
 import urllib.parse
-import asyncio  # pakai asyncio.sleep untuk backoff non-blocking
 
-VECTOR_DIR = os.getenv("VECTOR_DIR", "./data/vectorstore")
-
-def clear_store():
-    if os.path.exists(VECTOR_DIR):
-        shutil.rmtree(VECTOR_DIR)
-    os.makedirs(VECTOR_DIR, exist_ok=True)
+VECTOR_BASE = os.getenv("VECTOR_DIR", "/tmp/vectorstore").rstrip("/")
 
 MAX_HF_RETRIES = int(os.getenv("HF_MAX_RETRIES", "4"))
 HF_BACKOFF_S   = float(os.getenv("HF_BACKOFF_S", "1.5"))
+TIMEOUT        = int(os.getenv("REQUEST_TIMEOUT_S", "120"))
 
-TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_S", "120"))
+def _raise_502(msg: str):
+    raise HTTPException(status_code=502, detail=msg)
+
+def _dir_for(doc_id: str) -> str:
+    if not doc_id:
+        raise HTTPException(status_code=400, detail="Missing doc_id for vectorstore")
+    p = os.path.join(VECTOR_BASE, doc_id)
+    os.makedirs(p, exist_ok=True)
+    return p
+
+def clear_store(doc_id: Optional[str] = None):
+    """
+    - Jika doc_id diberikan: hapus folder index milik dokumen tsb.
+    - Jika None: hapus seluruh base (hindari di prod).
+    """
+    if doc_id:
+        p = os.path.join(VECTOR_BASE, doc_id)
+        if os.path.exists(p):
+            shutil.rmtree(p, ignore_errors=True)
+        os.makedirs(p, exist_ok=True)
+    else:
+        if os.path.exists(VECTOR_BASE):
+            shutil.rmtree(VECTOR_BASE, ignore_errors=True)
+        os.makedirs(VECTOR_BASE, exist_ok=True)
 
 def _cfg():
     return {
@@ -27,12 +45,6 @@ def _cfg():
         "LOCAL_MODEL": os.getenv("EMB_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
         "EMB_BATCH_SIZE": int(os.getenv("EMB_BATCH_SIZE", "64")),
     }
-
-def _ensure_dir():
-    os.makedirs(VECTOR_DIR, exist_ok=True)
-
-def _raise_502(msg: str):
-    raise HTTPException(status_code=502, detail=msg)
 
 def _l2_normalize(arr: np.ndarray) -> np.ndarray:
     return normalize(arr, norm="l2", axis=1)
@@ -59,8 +71,6 @@ async def embed_texts(texts: List[str]) -> np.ndarray:
 
         model_id = _resolve_hf_model_id()
         model_id_enc = urllib.parse.quote(model_id, safe='-_/')
-
-        # Pakai endpoint umum /models (lebih toleran, jarang 404)
         url = f"https://api-inference.huggingface.co/models/{model_id_enc}"
         headers = {
             "Authorization": f"Bearer {key}",
@@ -69,35 +79,21 @@ async def embed_texts(texts: List[str]) -> np.ndarray:
         }
 
         payload_inputs = texts[0] if len(texts) == 1 else texts
-
-        # Log supaya kelihatan PERSIS model dan URL-nya
-        print(f"[HF-EMB] backend=hf | model='{model_id}' | url={url}", flush=True)
-
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            r = await client.post(
-                url,
-                headers=headers,
-                json={
-                    "inputs": payload_inputs,
-                    # memaksa server siapin model; hindari 404/empty di load pertama
-                    "options": {"wait_for_model": True}
-                },
-            )
+            r = await client.post(url, headers=headers, json={
+                "inputs": payload_inputs,
+                "options": {"wait_for_model": True}
+            })
 
         if r.status_code >= 400:
-            # Bubble-up pesan server lengkap agar tahu akar masalahnya
             _raise_502(f"HF embeddings: {r.status_code} {r.text.strip()} (model='{model_id}')")
 
         data = r.json()
-
-        # Normalisasi output:
-        # - bisa [D] untuk single, atau [N,D], atau [N,T,D] (token-level)
         arr = np.array(data, dtype=np.float32)
 
         if arr.ndim == 1:
             arr = arr[None, :]
         elif arr.ndim == 3:
-            # pooling mean token → sentence embedding
             arr = arr.mean(axis=1)
 
         if arr.ndim != 2:
@@ -123,7 +119,7 @@ async def embed_texts(texts: List[str]) -> np.ndarray:
 
     elif backend == "local":
         try:
-            from sentence_transformers import SentenceTransformer  # lazy import
+            from sentence_transformers import SentenceTransformer
         except Exception as e:
             _raise_502(f"Local embeddings import failed: {e}")
         try:
@@ -142,22 +138,22 @@ async def embed_texts(texts: List[str]) -> np.ndarray:
     else:
         _raise_502(f"Unknown EMB_BACKEND={backend}")
 
-def _paths():
-    _ensure_dir()
+def _paths(doc_id: str):
+    d = _dir_for(doc_id)
     return (
-        os.path.join(VECTOR_DIR, "embeddings.npy"),
-        os.path.join(VECTOR_DIR, "texts.jsonl"),
+        os.path.join(d, "embeddings.npy"),
+        os.path.join(d, "texts.jsonl"),
     )
 
-def save_vectors(embs: np.ndarray, texts: List[str]) -> None:
-    p_emb, p_txt = _paths()
+def save_vectors(embs: np.ndarray, texts: List[str], doc_id: str) -> None:
+    p_emb, p_txt = _paths(doc_id)
     np.save(p_emb, embs)
     with open(p_txt, "w", encoding="utf-8") as f:
         for t in texts:
             f.write(json.dumps({"text": t}, ensure_ascii=False) + "\n")
 
-def load_vectors() -> Tuple[np.ndarray, List[str]]:
-    p_emb, p_txt = _paths()
+def load_vectors(doc_id: str) -> Tuple[np.ndarray, List[str]]:
+    p_emb, p_txt = _paths(doc_id)
     if not (os.path.exists(p_emb) and os.path.exists(p_txt)):
         raise HTTPException(status_code=400, detail="Belum ada dokumen terindeks. Silakan upload dulu.")
     embs = np.load(p_emb)
@@ -168,18 +164,18 @@ def load_vectors() -> Tuple[np.ndarray, List[str]]:
             texts.append(obj["text"])
     return embs, texts
 
-async def add_texts(chunks: List[str]) -> None:
+async def add_texts(chunks: List[str], doc_id: str) -> None:
     new_embs = await embed_texts(chunks)
     try:
-        embs, texts = load_vectors()
+        embs, texts = load_vectors(doc_id)
         embs = np.vstack([embs, new_embs])
         texts = texts + chunks
     except HTTPException:
         embs, texts = new_embs, chunks
-    save_vectors(embs, texts)
+    save_vectors(embs, texts, doc_id)
 
-async def search(query: str, top_k: int = 4) -> List[Tuple[str, float]]:
-    embs, texts = load_vectors()
+async def search(query: str, doc_id: str, top_k: int = 4) -> List[Tuple[str, float]]:
+    embs, texts = load_vectors(doc_id)
     q_emb = await embed_texts([query])
     sims = cosine_similarity(q_emb, embs)[0]
     idxs = sims.argsort()[::-1][:top_k]

@@ -8,7 +8,7 @@ from datetime import datetime
 from uuid import uuid4
 import httpx
 
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from PyPDF2 import PdfReader
@@ -17,7 +17,6 @@ from supabase import create_client, Client
 
 # ==== schemas & providers & vectorstore ====
 from schemas import (
-    UploadStatus,
     SummarizeRequest, SummarizeResponse, RagasScores,
     QARequest, QAResponse,
     FlashcardsRequest, Flashcard, FlashcardsResponse,
@@ -32,16 +31,18 @@ else:
     run_ragas_eval = None
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not SUPABASE_URL or not (SUPABASE_SERVICE_KEY or SUPABASE_KEY):
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY/SUPABASE_KEY")
 _EFF_KEY = SUPABASE_SERVICE_KEY or SUPABASE_KEY
-supabase: Client = create_client(SUPABASE_URL, _EFF_KEY)  
+supabase: Client = create_client(SUPABASE_URL, _EFF_KEY)  # type: ignore
 
+# ---- CORS ----
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "").strip()
 DEFAULT_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$|^https://.*\.vercel\.app$"
 CORS_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", DEFAULT_REGEX)
+
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 MIN_CHARS_PER_CHUNK = int(os.getenv("MIN_CHARS_PER_CHUNK", "300"))
@@ -49,12 +50,12 @@ MIN_CHARS_PER_CHUNK = int(os.getenv("MIN_CHARS_PER_CHUNK", "300"))
 origins = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
 logger = logging.getLogger("uvicorn.error")
 
-app = FastAPI(title="LearnWAI RAG App", version="1.3.0")
+app = FastAPI(title="LearnWAI RAG App", version="1.4.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins if origins else [],
-    allow_origin_regex=None if origins else CORS_ORIGIN_REGEX,  
+    allow_origin_regex=None if origins else CORS_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -78,11 +79,33 @@ STATUS: Dict[str, dict] = {}
 def new_job_id() -> str:
     return secrets.token_hex(16)
 
-def _set_status(job_id: str, stage: str, progress: int, message: str, ok: bool = True):
+def _upsert_job(job: dict):
+    try:
+        supabase.table("jobs").upsert(job, on_conflict="job_id").execute()
+    except Exception as e:
+        try:
+            supabase.table("jobs").update(job).eq("job_id", job["job_id"]).execute()
+        except Exception:
+            try:
+                supabase.table("jobs").insert(job).execute()
+            except Exception as e2:
+                print(f"[jobs] persist failed: {e} | {e2}", flush=True)
+
+def _set_status(job_id: str, stage: str, progress: int, message: str, ok: bool = True, doc_id: Optional[str] = None):
     s = {"job_id": job_id, "stage": stage, "progress": int(progress), "message": message, "ok": bool(ok)}
     STATUS[job_id] = s
     line = f"[STATUS] {job_id} | {stage} | {progress}% | {message}"
     print(line, flush=True); logger.info(line)
+    payload = {
+        "job_id": job_id,
+        "stage": stage,
+        "progress": int(progress),
+        "message": message,
+        "ok": bool(ok),
+    }
+    if doc_id:
+        payload["doc_id"] = doc_id
+    _upsert_job(payload)
 
 # ======== storage helpers ========
 
@@ -94,13 +117,6 @@ def _bucket_name_of(b) -> Optional[str]:
     return getattr(b, "name", None) or getattr(b, "id", None)
 
 def ensure_bucket(name: str = BUCKET_NAME, public: bool = True):
-    """
-    Robust bucket creator untuk berbagai versi storage3.
-    1) Cek apakah bucket sudah ada.
-    2) Coba signature A: create_bucket(name, public=True)
-    3) Jika TypeError -> signature B: create_bucket(name, {"name": name, "public": True})
-    4) Jika gagal -> fallback REST POST /storage/v1/bucket
-    """
     try:
         buckets = supabase.storage.list_buckets()
         if any((_bucket_name_of(b) == name) for b in buckets):
@@ -117,7 +133,6 @@ def ensure_bucket(name: str = BUCKET_NAME, public: bool = True):
     except Exception as e:
         if "already exists" in str(e) or "409" in str(e):
             return
-        pass
 
     try:
         options = {"name": name, "public": bool(public)}
@@ -153,6 +168,7 @@ def ensure_bucket(name: str = BUCKET_NAME, public: bool = True):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Create bucket failed: {e}")
 
+# ======== small helpers ========
 def _extract_pdf_text(data: bytes) -> str:
     with io.BytesIO(data) as bio:
         reader = PdfReader(bio)
@@ -232,6 +248,28 @@ def _dedup_cards(cards: List[Flashcard]) -> List[Flashcard]:
         seen.add(key)
         out.append(c)
     return out
+
+# ==== Document lookup ====
+def _doc_by_id(doc_id: str):
+    res = supabase.table("documents").select("*").eq("id", doc_id).limit(1).execute()
+    return res.data[0] if res.data else None
+
+def _doc_by_slug(slug: str):
+    res = supabase.table("documents").select("*").eq("slug", slug).limit(1).execute()
+    return res.data[0] if res.data else None
+
+def _resolve_doc_id(doc_id: Optional[str], slug: Optional[str], allow_not_ready: bool = False) -> str:
+    d = None
+    if doc_id:
+        d = _doc_by_id(doc_id)
+    elif slug:
+        d = _doc_by_slug(slug)
+    if not d:
+        raise HTTPException(status_code=400, detail="doc not found")
+    # <-- ini yang bikin 409 saat pipeline masih jalan
+    if not allow_not_ready and (d.get("status") or "") != "ready":
+        raise HTTPException(status_code=409, detail="Document is not ready yet")
+    return d["id"]
 
 # =====================================
 #               AUTH
@@ -323,7 +361,17 @@ async def documents_upload(
     job_id = new_job_id()
     if background_tasks is None:
         raise HTTPException(status_code=500, detail="Background tasks not available")
-    _set_status(job_id, "received", 5, f"File received: {title}")
+
+    _upsert_job({
+        "job_id": job_id,
+        "doc_id": doc_id,
+        "stage": "received",
+        "progress": 5,
+        "message": f"File received: {title}",
+        "ok": True,
+    })
+
+    _set_status(job_id, "received", 5, f"File received: {title}", ok=True, doc_id=doc_id)
     background_tasks.add_task(_pipeline_process, job_id, doc_id, title, raw)
 
     return {"job_id": job_id, "document": ins.data[0]}
@@ -331,37 +379,47 @@ async def documents_upload(
 @app.get("/api/status/{job_id}")
 async def job_status(job_id: str):
     st = STATUS.get(job_id)
-    if not st:
-        raise HTTPException(status_code=404, detail="job_id not found")
-    return st
+    if st:
+        return st
+    res = supabase.table("jobs").select("*").eq("job_id", job_id).limit(1).execute()
+    if res.data:
+        row = res.data[0]
+        return {
+            "job_id": row["job_id"],
+            "stage": row["stage"],
+            "progress": row["progress"],
+            "message": row.get("message") or "",
+            "ok": bool(row.get("ok", True)),
+        }
+    raise HTTPException(status_code=404, detail="job_id not found")
 
 async def _pipeline_process(job_id: str, doc_id: str, title: str, raw: bytes):
     try:
-        clear_store()
-        _set_status(job_id, "extract", 10, "Extracting PDF…")
+        clear_store(doc_id)  
+        _set_status(job_id, "extract", 10, "Extracting PDF…", doc_id=doc_id)
         text = _extract_pdf_text(raw)
 
-        _set_status(job_id, "normalize", 20, "Normalizing…")
+        _set_status(job_id, "normalize", 20, "Normalizing…", doc_id=doc_id)
         text = normalize_text(text)
 
-        _set_status(job_id, "split", 35, "Chunking…")
+        _set_status(job_id, "split", 35, "Chunking…", doc_id=doc_id)
         chunks = chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP, MIN_CHARS_PER_CHUNK)
         if not chunks:
             raise HTTPException(status_code=400, detail="Document too short after normalization")
 
-        _set_status(job_id, "embedding", 60, "Embedding & indexing…")
-        await asyncio.shield(add_texts(chunks))
+        _set_status(job_id, "embedding", 60, "Embedding & indexing…", doc_id=doc_id)
+        await asyncio.shield(add_texts(chunks, doc_id))
 
-        _set_status(job_id, "embedding", 80, "Generating summary…")
+        _set_status(job_id, "embedding", 80, "Generating summary…", doc_id=doc_id)
         try:
-            sum_res: SummarizeResponse = await summarize(SummarizeRequest(query="ringkas dokumen ini"))  # type: ignore
+            sum_res: SummarizeResponse = await summarize(SummarizeRequest(query="ringkas dokumen ini"), doc_id=doc_id, internal=True)  # type: ignore
             summary_text = sum_res.text
         except Exception as e:
             summary_text = f"(summary failed: {e})"
 
-        _set_status(job_id, "embedding", 88, "Generating flashcards…")
+        _set_status(job_id, "embedding", 88, "Generating flashcards…", doc_id=doc_id)
         try:
-            fc_res: FlashcardsResponse = await flashcards(FlashcardsRequest(question_hint=None))  # type: ignore
+            fc_res: FlashcardsResponse = await flashcards(FlashcardsRequest(question_hint=None), doc_id=doc_id, internal=True)  # type: ignore
             flashcards_json = [c.dict() for c in fc_res.cards]
         except Exception as e:
             flashcards_json = [{"question": "Generation failed", "answer": str(e)}]
@@ -372,11 +430,14 @@ async def _pipeline_process(job_id: str, doc_id: str, title: str, raw: bytes):
             "flashcards": flashcards_json,
         }).eq("id", doc_id).execute()
 
-        _set_status(job_id, "done", 100, "Ready", ok=True)
+        _set_status(job_id, "done", 100, "Ready", ok=True, doc_id=doc_id)
 
     except Exception as e:
-        _set_status(job_id, "error", 100, str(e), ok=False)
-        supabase.table("documents").update({"status": "error"}).eq("id", doc_id).execute()
+        _set_status(job_id, "error", 100, str(e), ok=False, doc_id=doc_id)
+        try:
+            supabase.table("documents").update({"status": "error"}).eq("id", doc_id).execute()
+        except Exception:
+            pass
 
 @app.get("/documents")
 def list_documents(user_id: Optional[str] = None):
@@ -401,12 +462,19 @@ def get_document_by_slug(slug: str):
     return {"data": res.data[0]}
 
 # =====================================
-#        RAG endpoints (uses index)
+#        RAG endpoints (per doc index)
 # =====================================
 @app.post("/api/summarize", response_model=SummarizeResponse)
-async def summarize(req: SummarizeRequest):
+async def summarize(
+    req: SummarizeRequest,
+    doc_id: Optional[str] = Query(None),
+    slug: Optional[str] = Query(None),
+    internal: bool = False,  
+):
+
+    did = _resolve_doc_id(doc_id, slug, allow_not_ready=internal)
     query = (req.query or "ringkas dokumen ini").strip()
-    results = await search(query, top_k=12)
+    results = await search(query, did, top_k=12)
     filtered = sorted([(t, s) for t, s in results if s >= 0.28], key=lambda x: x[1], reverse=True)[:3]
     contexts = _dedup([t for t, _ in filtered]) or [t for t, _ in results[:3]]
 
@@ -420,35 +488,41 @@ async def summarize(req: SummarizeRequest):
     )
     text, _ = await providers.generate(prompt, system)
     ragas = _ragas_or_none(query, text, contexts)
-    if ragas is None:
+    if ragas is None and run_ragas_eval is not None:
         ragas = await run_ragas_eval(question=query, answer=text, contexts=contexts, ground_truth=None)
     return SummarizeResponse(text=text, contexts=contexts, ragas=RagasScores(**ragas))
 
 @app.post("/api/qa", response_model=QAResponse)
-async def qa(req: QARequest):
+async def qa(
+    req: QARequest,
+    doc_id: Optional[str] = Query(None),
+    slug: Optional[str] = Query(None),
+):
     if not req.question or not req.question.strip():
         raise HTTPException(status_code=400, detail="Pertanyaan kosong.")
-    results = await search(req.question.strip(), top_k=6)
+    did = _resolve_doc_id(doc_id, slug)
+    results = await search(req.question.strip(), did, top_k=6)
     contexts = _dedup([t for t, _ in results])
     system = "Jawab EKSTRAKTIF dari konteks. Jika tidak ada, jawab: 'Tidak ada di konteks.' Sertakan kutipan 2–6 kata."
     prompt = "KONTEKS:\n" + "\n---\n".join(contexts) + f"\n\nPertanyaan: {req.question.strip()}\nJawaban:"
     answer, _ = await providers.generate(prompt, system)
     ragas = _ragas_or_none(req.question.strip(), answer, contexts)
-    if ragas is None:
+    if ragas is None and run_ragas_eval is not None:
         ragas = await run_ragas_eval(question=req.question.strip(), answer=answer, contexts=contexts, ground_truth=None)
     return QAResponse(answer=answer, contexts=contexts, ragas=RagasScores(**ragas))
 
 @app.post("/api/flashcards", response_model=FlashcardsResponse)
-async def flashcards(req: FlashcardsRequest):
-    """
-    Hasilkan 15 flashcards unik (tanpa pertanyaan duplikat).
-    Jika generasi pertama kurang dari 15, lakukan pengisian ulang
-    untuk melengkapi kekurangannya dengan pertanyaan berbeda.
-    """
+async def flashcards(
+    req: FlashcardsRequest,
+    doc_id: Optional[str] = Query(None),
+    slug: Optional[str] = Query(None),
+    internal: bool = False,
+):
+    did = _resolve_doc_id(doc_id, slug, allow_not_ready=internal)
     target_n = 15
     hint = (req.question_hint or "").strip()
 
-    results = await search(hint or "buat flashcards dari dokumen ini", top_k=8)
+    results = await search(hint or "buat flashcards dari dokumen ini", did, top_k=8)
     contexts = _dedup([t for t, _ in results])
 
     system = (
@@ -485,14 +559,13 @@ async def flashcards(req: FlashcardsRequest):
 
     if not cards:
         cards = [Flashcard(question="What is the main topic of this document?", answer="Not enough context to extract.")]
-
     if len(cards) > target_n:
         cards = cards[:target_n]
 
     if cards:
         sample_q, sample_a = cards[0].question, cards[0].answer
         ragas = _ragas_or_none(sample_q, sample_a, contexts)
-        if ragas is None:
+        if ragas is None and run_ragas_eval is not None:
             ragas = await run_ragas_eval(question=sample_q, answer=sample_a, contexts=contexts, ground_truth=None)
     else:
         ragas = _ragas_or_none("", "", contexts)
