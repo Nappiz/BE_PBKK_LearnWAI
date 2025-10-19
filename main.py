@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os, re, io, asyncio, logging, secrets, bcrypt, unicodedata
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 from uuid import uuid4
 import httpx
@@ -47,10 +47,13 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 MIN_CHARS_PER_CHUNK = int(os.getenv("MIN_CHARS_PER_CHUNK", "300"))
 
+# Generation prefs (untuk budgeting kasar)
+GEN_MAX_TOKENS = int(os.getenv("GEN_MAX_TOKENS", "2048"))
+
 origins = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
 logger = logging.getLogger("uvicorn.error")
 
-app = FastAPI(title="LearnWAI RAG App", version="1.4.0")
+app = FastAPI(title="LearnWAI RAG App", version="1.5.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -266,7 +269,6 @@ def _resolve_doc_id(doc_id: Optional[str], slug: Optional[str], allow_not_ready:
         d = _doc_by_slug(slug)
     if not d:
         raise HTTPException(status_code=400, detail="doc not found")
-    # <-- ini yang bikin 409 saat pipeline masih jalan
     if not allow_not_ready and (d.get("status") or "") != "ready":
         raise HTTPException(status_code=409, detail="Document is not ready yet")
     return d["id"]
@@ -395,7 +397,7 @@ async def job_status(job_id: str):
 
 async def _pipeline_process(job_id: str, doc_id: str, title: str, raw: bytes):
     try:
-        clear_store(doc_id)  
+        clear_store(doc_id)
         _set_status(job_id, "extract", 10, "Extracting PDF…", doc_id=doc_id)
         text = _extract_pdf_text(raw)
 
@@ -461,6 +463,122 @@ def get_document_by_slug(slug: str):
         raise HTTPException(status_code=404, detail="Document not found")
     return {"data": res.data[0]}
 
+# ===== Helpers RAG =====
+def _pick_contexts(
+    results: List[tuple[str, float]],
+    min_sim: float,
+    max_chunks: int,
+    char_budget: int,
+) -> List[str]:
+    cands = [(t, s) for t, s in results if s >= min_sim]
+    cands.sort(key=lambda x: x[1], reverse=True)
+    ordered = _dedup([t for t, _ in cands])
+
+    chosen: List[str] = []
+    total = 0
+    for t in ordered:
+        if len(chosen) >= max_chunks:
+            break
+        if total + len(t) + 1 > char_budget and len(chosen) > 0:
+            break
+        chosen.append(t)
+        total += len(t) + 1
+
+    if not chosen and results:
+        top = _dedup([t for t, _ in results])[: max(1, max_chunks // 2)]
+        chosen = top
+    return chosen
+
+def _strip_end_tag(s: str) -> str:
+    return s.replace("[END]", "").strip()
+
+async def _safe_generate(prompt: str, system: str) -> str:
+    """
+    Pembungkus generate: batasi panjang agar menghindari 502 MAX_TOKENS.
+    Selalu strip token [END] dari output agar tidak bocor ke UI.
+    """
+    END_TAG = "[END]"
+    limiting_hint = (
+        "\n\nBatas keras: maksimal ~700 kata. Stop segera sebelum melebihi batas. "
+        f"Tutup jawaban dengan token {END_TAG}"
+    )
+    try:
+        text, _meta = await providers.generate(prompt + limiting_hint, system)
+        return _strip_end_tag(text)
+    except Exception as e:
+        msg = str(e)
+        if "MAX_TOKENS" in msg or "bad response" in msg:
+            short_prompt = prompt
+            if "\n---\n" in prompt:
+                parts = prompt.split("\n---\n")
+                keep = max(1, len(parts) // 2)
+                short_prompt = "\n---\n".join(parts[:keep])
+            try:
+                text2, _meta2 = await providers.generate(short_prompt + limiting_hint, system)
+                return _strip_end_tag(text2)
+            except Exception:
+                return f"(generation failed: {msg})"
+        return f"(generation failed: {msg})"
+
+def _looks_truncated(txt: str) -> bool:
+    if not txt:
+        return False
+    tail = txt[-220:].strip()
+    return not any(tail.endswith(p) for p in (".", "!", "?", ".”", "!”", "?”")) and len(txt) > 600
+
+async def _generate_with_continue(prompt: str, system: str, hops: int = 1) -> str:
+    END_TAG = "[END]"
+    combined = ""
+    for i in range(max(1, hops + 1)):
+        base = (
+            prompt if i == 0 else
+            prompt + "\n\nLANJUTKAN dari kalimat terakhir tanpa mengulang. Tetap EKSTRAKTIF."
+        )
+        limiter = (
+            "\n\nBatas keras: maksimal ~500 kata untuk bagian ini. "
+            f"Tutup jawaban dengan token {END_TAG}"
+        )
+        piece = await _safe_generate(base + limiter, system)
+        piece = _strip_end_tag(piece)
+        if i == 0:
+            combined = piece
+        else:
+            combined = (combined.rstrip() + "\n\n" + piece.lstrip()).strip()
+        if not _looks_truncated(piece):
+            break
+    return combined
+
+# ====== STUDY-SUMMARIZER (naratif, tanpa paksaan list) ======
+def _study_block_prompt(contexts: List[str]) -> Tuple[str, str]:
+    system = (
+        "Anda adalah peringkas EKSTRAKTIF untuk bahan belajar. "
+        "Gunakan HANYA kalimat/angka dari KONTEKS. Dilarang menambah fakta baru."
+    )
+    prompt = (
+        "KONTEKS:\n" + "\n---\n".join(contexts) +
+        "\n\nTULIS rangkuman belajar bergaya NARATIF yang komprehensif, mengalir, dan mudah diikuti. "
+        "Tidak harus berupa daftar. Boleh subjudul seperlunya (opsional). "
+        "Fokus pada hal penting untuk persiapan ujian: konsep & definisi kunci (dengan penjelasan ringkas), "
+        "rumus/teorema & kapan digunakan, fakta/timeline penting, hubungan sebab-akibat utama, contoh representatif, "
+        "serta miskonsepsi umum bila tersirat di konteks. Tetap EKSTRAKTIF (boleh kutip frasa 2–10 kata)."
+    )
+    return prompt, system
+
+def _study_merge_prompt(partials: List[str]) -> Tuple[str, str]:
+    system = (
+        "Anda adalah penyusun rangkuman belajar akhir. Tetap EKSTRAKTIF dari bahan parsial, "
+        "gabungkan, hilangkan duplikasi, rapikan alur, dan konsistensi istilah. "
+        "Jangan menambah fakta baru."
+    )
+    prompt = (
+        "BERIKUT KUMPULAN RANGKUMAN PARSIAL:\n\n" +
+        "\n\n===== PARTIAL =====\n\n".join(partials) +
+        "\n\nSUSUN SATU rangkuman belajar AKHIR bergaya NARATIF yang utuh, jelas, dan mudah dipelajari. "
+        "Bebas format (tidak harus daftar). Boleh paragraf/subjudul seperlunya. "
+        "Pastikan memuat item penting untuk ujian dan akhiri dengan rekap singkat."
+    )
+    return prompt, system
+
 # =====================================
 #        RAG endpoints (per doc index)
 # =====================================
@@ -469,28 +587,59 @@ async def summarize(
     req: SummarizeRequest,
     doc_id: Optional[str] = Query(None),
     slug: Optional[str] = Query(None),
-    internal: bool = False,  
+    internal: bool = False,
 ):
-
     did = _resolve_doc_id(doc_id, slug, allow_not_ready=internal)
     query = (req.query or "ringkas dokumen ini").strip()
-    results = await search(query, did, top_k=12)
-    filtered = sorted([(t, s) for t, s in results if s >= 0.28], key=lambda x: x[1], reverse=True)[:3]
-    contexts = _dedup([t for t, _ in filtered]) or [t for t, _ in results[:3]]
 
-    system = "Anda adalah peringkas EKSTRAKTIF yang akurat. Gunakan HANYA kalimat dari konteks; jangan tambah fakta."
-    prompt = (
-        "KONTEKS:\n" + "\n---\n".join(contexts) +
-        "\n\nInstruksi ringkasan:\n"
-        "- Ringkas poin penting, ekstraktif, tanpa halusinasi.\n"
-        "- Sertakan kutipan pendek untuk klaim kunci.\n"
-        "- Bahasa mengikuti bahasa sumber."
+    results = await search(query, did, top_k=28)
+
+    contexts_pool = _pick_contexts(
+        results=results,
+        min_sim=0.24,
+        max_chunks=10,
+        char_budget=9000
     )
-    text, _ = await providers.generate(prompt, system)
-    ragas = _ragas_or_none(query, text, contexts)
+
+    BATCH_SIZE = 3
+    MAX_GROUPS = 3
+    batches: List[List[str]] = []
+    cur: List[str] = []
+    for t in contexts_pool:
+        cur.append(t)
+        if len(cur) == BATCH_SIZE:
+            batches.append(cur); cur = []
+        if len(batches) >= MAX_GROUPS:
+            break
+    if cur and len(batches) < MAX_GROUPS:
+        batches.append(cur)
+
+    partials: List[str] = []
+    for b in batches:
+        p, s = _study_block_prompt(b)
+        part = await _generate_with_continue(p, s, hops=1)
+        partials.append(part.strip())
+
+    if not partials:
+        contexts = _pick_contexts(results=results, min_sim=0.22, max_chunks=5, char_budget=6000)
+        p, s = _study_block_prompt(contexts)
+        text = await _generate_with_continue(p, s, hops=1)
+        ragas = _ragas_or_none(query, text, contexts)
+        if ragas is None and run_ragas_eval is not None:
+            ragas = await run_ragas_eval(question=query, answer=text, contexts=contexts, ground_truth=None)
+        return SummarizeResponse(text=text, contexts=contexts, ragas=RagasScores(**ragas))
+
+    merge_prompt, merge_system = _study_merge_prompt(partials)
+    final_text = await _generate_with_continue(merge_prompt, merge_system, hops=1)
+
+    used_contexts = _dedup([t for b in batches for t in b])
+
+    ragas = _ragas_or_none(query, final_text, used_contexts)
     if ragas is None and run_ragas_eval is not None:
-        ragas = await run_ragas_eval(question=query, answer=text, contexts=contexts, ground_truth=None)
-    return SummarizeResponse(text=text, contexts=contexts, ragas=RagasScores(**ragas))
+        ragas = await run_ragas_eval(
+            question=query, answer=final_text, contexts=used_contexts, ground_truth=None
+        )
+    return SummarizeResponse(text=final_text, contexts=used_contexts, ragas=RagasScores(**ragas))
 
 @app.post("/api/qa", response_model=QAResponse)
 async def qa(
@@ -498,17 +647,57 @@ async def qa(
     doc_id: Optional[str] = Query(None),
     slug: Optional[str] = Query(None),
 ):
-    if not req.question or not req.question.strip():
+    q = (req.question or "").strip()
+    if not q:
         raise HTTPException(status_code=400, detail="Pertanyaan kosong.")
     did = _resolve_doc_id(doc_id, slug)
-    results = await search(req.question.strip(), did, top_k=6)
-    contexts = _dedup([t for t, _ in results])
-    system = "Jawab EKSTRAKTIF dari konteks. Jika tidak ada, jawab: 'Tidak ada di konteks.' Sertakan kutipan 2–6 kata."
-    prompt = "KONTEKS:\n" + "\n---\n".join(contexts) + f"\n\nPertanyaan: {req.question.strip()}\nJawaban:"
-    answer, _ = await providers.generate(prompt, system)
-    ragas = _ragas_or_none(req.question.strip(), answer, contexts)
+
+    results = await search(q, did, top_k=16)
+
+    contexts = _pick_contexts(
+        results=results,
+        min_sim=0.18,
+        max_chunks=8,
+        char_budget=7000
+    )
+
+    if not contexts and results:
+        contexts = _dedup([t for t, _ in results])[:3]
+
+    system = (
+        "Jawab SECARA EKSTRAKTIF hanya dari konteks. "
+        "Jika dan hanya jika tidak ada informasi relevan di konteks, jawab: 'Tidak ada di konteks.' "
+        "Jika konteks TIDAK kosong, WAJIB berikan jawaban yang ditopang kutipan 2–6 kata."
+    )
+    limiter = "\n\nBatas keras: maksimal ~250 kata. Jawab langsung, sertakan kutipan pendek."
+
+    prompt = "KONTEKS:\n" + "\n---\n".join(contexts) + f"\n\nPertanyaan: {q}\nJawaban:" + limiter
+
+    answer = await _safe_generate(prompt, system)
+    answer = _strip_end_tag(answer)
+
+    if contexts and "Tidak ada di konteks" in answer:
+        results2 = await search(q, did, top_k=24)
+        contexts2 = _pick_contexts(results=results2, min_sim=0.0, max_chunks=10, char_budget=9000)
+        if not contexts2 and results2:
+            contexts2 = _dedup([t for t, _ in results2])[:5]
+
+        prompt2 = "KONTEKS:\n" + "\n---\n".join(contexts2) + f"\n\nPertanyaan: {q}\nJawaban:" + limiter
+        answer2 = await _safe_generate(prompt2, system)
+        answer2 = _strip_end_tag(answer2)
+
+        if answer2.strip() and "Tidak ada di konteks" not in answer2:
+            answer = answer2
+            contexts = contexts2
+
+    if not contexts and (not answer or answer.strip() == ""):
+        answer = "Tidak ada di konteks."
+
+    ragas = _ragas_or_none(q, answer, contexts)
     if ragas is None and run_ragas_eval is not None:
-        ragas = await run_ragas_eval(question=req.question.strip(), answer=answer, contexts=contexts, ground_truth=None)
+        ragas = await run_ragas_eval(
+            question=q, answer=answer, contexts=contexts, ground_truth=None
+        )
     return QAResponse(answer=answer, contexts=contexts, ragas=RagasScores(**ragas))
 
 @app.post("/api/flashcards", response_model=FlashcardsResponse)
@@ -519,11 +708,18 @@ async def flashcards(
     internal: bool = False,
 ):
     did = _resolve_doc_id(doc_id, slug, allow_not_ready=internal)
+
     target_n = 15
     hint = (req.question_hint or "").strip()
 
-    results = await search(hint or "buat flashcards dari dokumen ini", did, top_k=8)
-    contexts = _dedup([t for t, _ in results])
+    results = await search(hint or "buat flashcards dari dokumen ini", did, top_k=14)
+
+    contexts = _pick_contexts(
+        results=results,
+        min_sim=0.20,
+        max_chunks=8,
+        char_budget=8000
+    )
 
     system = (
         "Buat KARTU TANYA-JAWAB berbasis konteks SECARA EKSTRAKTIF.\n"
@@ -537,7 +733,7 @@ async def flashcards(
         "JANGAN mengulang atau memodifikasi sedikit pertanyaan yang sama."
     )
 
-    text1, _ = await providers.generate(base_prompt, system)
+    text1 = await _safe_generate(base_prompt, system)
     cards = _dedup_cards(_parse_flashcards(text1))
 
     attempts = 2
@@ -553,12 +749,15 @@ async def flashcards(
             f"Buat TEPAT {remaining} kartu tambahan yang benar-benar berbeda. "
             "Format tetap Q:/A:, tanpa penomoran dan tanpa teks lain."
         )
-        text_more, _ = await providers.generate(fill_prompt, system)
+        text_more = await _safe_generate(fill_prompt, system)
         more = _dedup_cards(_parse_flashcards(text_more))
         cards = _dedup_cards(cards + more)
 
     if not cards:
-        cards = [Flashcard(question="What is the main topic of this document?", answer="Not enough context to extract.")]
+        cards = [Flashcard(
+            question="What is the main topic of this document?",
+            answer="Not enough context to extract."
+        )]
     if len(cards) > target_n:
         cards = cards[:target_n]
 
@@ -566,7 +765,9 @@ async def flashcards(
         sample_q, sample_a = cards[0].question, cards[0].answer
         ragas = _ragas_or_none(sample_q, sample_a, contexts)
         if ragas is None and run_ragas_eval is not None:
-            ragas = await run_ragas_eval(question=sample_q, answer=sample_a, contexts=contexts, ground_truth=None)
+            ragas = await run_ragas_eval(
+                question=sample_q, answer=sample_a, contexts=contexts, ground_truth=None
+            )
     else:
         ragas = _ragas_or_none("", "", contexts)
 
