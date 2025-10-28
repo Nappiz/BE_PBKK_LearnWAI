@@ -4,13 +4,14 @@ load_dotenv()
 
 import os, re, io, asyncio, logging, secrets, bcrypt, unicodedata
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
+from urllib.parse import urlparse
 import httpx
 
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from PyPDF2 import PdfReader
 
 from supabase import create_client, Client
@@ -47,13 +48,14 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 MIN_CHARS_PER_CHUNK = int(os.getenv("MIN_CHARS_PER_CHUNK", "300"))
 
-# Generation prefs (untuk budgeting kasar)
 GEN_MAX_TOKENS = int(os.getenv("GEN_MAX_TOKENS", "2048"))
 
 origins = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
 logger = logging.getLogger("uvicorn.error")
 
-app = FastAPI(title="LearnWAI RAG App", version="1.5.1")
+APP_VERSION = "1.5.3"
+
+app = FastAPI(title="LearnWAI RAG App", version=APP_VERSION)
 
 app.add_middleware(
     CORSMiddleware,
@@ -75,6 +77,10 @@ class RegisterIn(BaseModel):
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
+
+# ======== update payloads ========
+class UpdateDocumentIn(BaseModel):
+    title: Optional[str] = Field(default=None, min_length=1, max_length=300)
 
 # ======== in-memory job status ========
 STATUS: Dict[str, dict] = {}
@@ -248,11 +254,10 @@ def _dedup_cards(cards: List[Flashcard]) -> List[Flashcard]:
         key = re.sub(r"\s+", " ", c.question.strip().lower())
         if not key or key in seen:
             continue
-        seen.add(key)
-        out.append(c)
+        seen.add(key); out.append(c)
     return out
 
-# ==== Document lookup ====
+# ==== Document lookup & fallbacks ====
 def _doc_by_id(doc_id: str):
     res = supabase.table("documents").select("*").eq("id", doc_id).limit(1).execute()
     return res.data[0] if res.data else None
@@ -261,17 +266,55 @@ def _doc_by_slug(slug: str):
     res = supabase.table("documents").select("*").eq("slug", slug).limit(1).execute()
     return res.data[0] if res.data else None
 
-def _resolve_doc_id(doc_id: Optional[str], slug: Optional[str], allow_not_ready: bool = False) -> str:
+def _latest_ready_doc(user_id: Optional[str] = None):
+    q = supabase.table("documents").select("*").eq("status", "ready").order("created_at", desc=True)
+    if user_id:
+        q = q.eq("user_id", user_id)
+    res = q.limit(1).execute()
+    return res.data[0] if res.data else None
+
+def _resolve_doc_id(doc_id: Optional[str], slug: Optional[str], allow_not_ready: bool = False, user_id: Optional[str] = None) -> str:
     d = None
     if doc_id:
         d = _doc_by_id(doc_id)
     elif slug:
         d = _doc_by_slug(slug)
+    else:
+        d = _latest_ready_doc(user_id=user_id)
+
     if not d:
-        raise HTTPException(status_code=400, detail="doc not found")
+        raise HTTPException(status_code=400, detail="No ready document found. Upload or specify doc_id/slug.")
     if not allow_not_ready and (d.get("status") or "") != "ready":
         raise HTTPException(status_code=409, detail="Document is not ready yet")
     return d["id"]
+
+# Extract storage path from public URL
+def _extract_path_from_public_url(public_url: Optional[str]) -> Optional[str]:
+    """
+    Supabase public URL example:
+    https://<proj>.supabase.co/storage/v1/object/public/documents/<folder>/<doc_id>.pdf
+    We need '<folder>/<doc_id>.pdf'
+    """
+    if not public_url:
+        return None
+    try:
+        u = urlparse(public_url)
+        # find "/object/public/<bucket>/" then take the tail
+        m = re.search(r"/object/public/([^/]+)/(.+)$", u.path)
+        if not m:
+            # older style: .../storage/v1/object/public/<bucket>/<path>
+            # already handled by regex; fallback try by bucket name
+            idx = u.path.find(f"/{BUCKET_NAME}/")
+            if idx != -1:
+                return u.path[idx + len(BUCKET_NAME) + 2:]  # skip "/<bucket>/"
+            return None
+        bucket = m.group(1)
+        tail = m.group(2)
+        if bucket != BUCKET_NAME:
+            return None
+        return tail
+    except Exception:
+        return None
 
 # =====================================
 #               AUTH
@@ -463,6 +506,59 @@ def get_document_by_slug(slug: str):
         raise HTTPException(status_code=404, detail="Document not found")
     return {"data": res.data[0]}
 
+# ===== NEW: update & delete =====
+
+@app.patch("/documents/{doc_id}")
+def update_document(doc_id: str, body: UpdateDocumentIn):
+    row = _doc_by_id(doc_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Document not found")
+    updates: Dict[str, object] = {}
+    if body.title is not None:
+        title = body.title.strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="Title cannot be empty")
+        if len(title) > 300:
+            raise HTTPException(status_code=400, detail="Title too long")
+        updates["title"] = title
+        # NOTE: sengaja tidak mengubah slug agar permalink lama tetap valid
+    if not updates:
+        return {"ok": True, "data": row}
+    res = supabase.table("documents").update(updates).eq("id", doc_id).execute()
+    return {"ok": True, "data": (res.data[0] if res.data else {**row, **updates})}
+
+@app.delete("/documents/{doc_id}")
+def delete_document(doc_id: str):
+    row = _doc_by_id(doc_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # 1) delete from storage (best-effort)
+    p = _extract_path_from_public_url(row.get("url"))
+    try:
+        if p:
+            supabase.storage.from_(BUCKET_NAME).remove([p])
+    except Exception as e:
+        # Jangan fail hard kalau storage remove error – tetap lanjut hapus row
+        print(f"[storage] remove failed for {p}: {e}", flush=True)
+
+    # 2) clear vector index (best-effort)
+    try:
+        clear_store(doc_id)
+    except Exception as e:
+        print(f"[vectorstore] clear_store({doc_id}) failed: {e}", flush=True)
+
+    # 3) delete DB row
+    supabase.table("documents").delete().eq("id", doc_id).execute()
+
+    # 4) optional: hapus jobs yang terkait (best-effort)
+    try:
+        supabase.table("jobs").delete().eq("doc_id", doc_id).execute()
+    except Exception:
+        pass
+
+    return {"ok": True, "id": doc_id}
+
 # ===== Helpers RAG =====
 def _pick_contexts(
     results: List[tuple[str, float]],
@@ -493,10 +589,6 @@ def _strip_end_tag(s: str) -> str:
     return s.replace("[END]", "").strip()
 
 async def _safe_generate(prompt: str, system: str) -> str:
-    """
-    Pembungkus generate: batasi panjang agar menghindari 502 MAX_TOKENS.
-    Selalu strip token [END] dari output agar tidak bocor ke UI.
-    """
     END_TAG = "[END]"
     limiting_hint = (
         "\n\nBatas keras: maksimal ~700 kata. Stop segera sebelum melebihi batas. "
@@ -548,7 +640,7 @@ async def _generate_with_continue(prompt: str, system: str, hops: int = 1) -> st
             break
     return combined
 
-# ====== STUDY-SUMMARIZER (naratif, tanpa paksaan list) ======
+# ====== STUDY-SUMMARIZER ======
 def _study_block_prompt(contexts: List[str]) -> Tuple[str, str]:
     system = (
         "Anda adalah peringkas EKSTRAKTIF untuk bahan belajar. "
@@ -587,9 +679,10 @@ async def summarize(
     req: SummarizeRequest,
     doc_id: Optional[str] = Query(None),
     slug: Optional[str] = Query(None),
+    user_id: Optional[str] = Query(None),
     internal: bool = False,
 ):
-    did = _resolve_doc_id(doc_id, slug, allow_not_ready=internal)
+    did = _resolve_doc_id(doc_id, slug, allow_not_ready=internal, user_id=user_id)
     query = (req.query or "ringkas dokumen ini").strip()
 
     results = await search(query, did, top_k=28)
@@ -646,11 +739,12 @@ async def qa(
     req: QARequest,
     doc_id: Optional[str] = Query(None),
     slug: Optional[str] = Query(None),
+    user_id: Optional[str] = Query(None),
 ):
     q = (req.question or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="Pertanyaan kosong.")
-    did = _resolve_doc_id(doc_id, slug)
+    did = _resolve_doc_id(doc_id, slug, user_id=user_id)
 
     results = await search(q, did, top_k=16)
 
@@ -705,9 +799,10 @@ async def flashcards(
     req: FlashcardsRequest,
     doc_id: Optional[str] = Query(None),
     slug: Optional[str] = Query(None),
+    user_id: Optional[str] = Query(None),
     internal: bool = False,
 ):
-    did = _resolve_doc_id(doc_id, slug, allow_not_ready=internal)
+    did = _resolve_doc_id(doc_id, slug, allow_not_ready=internal, user_id=user_id)
 
     target_n = 15
     hint = (req.question_hint or "").strip()
@@ -772,3 +867,59 @@ async def flashcards(
         ragas = _ragas_or_none("", "", contexts)
 
     return FlashcardsResponse(cards=cards, contexts=contexts, ragas=RagasScores(**ragas))
+
+# =====================================
+#                HEALTH
+# =====================================
+@app.get("/health")
+async def health():
+    now = datetime.now(timezone.utc).isoformat()
+    provider = os.getenv("LLM_PROVIDER", "unknown")
+    senopati_base = os.getenv("SENOPATI_BASE_URL", "")
+    senopati_host = urlparse(senopati_base).netloc if senopati_base else ""
+    senopati_model = os.getenv("SENOPATI_MODEL", os.getenv("LLM_MODEL", ""))
+
+    supa_host = urlparse(SUPABASE_URL).netloc if SUPABASE_URL else ""
+    supa_ok = True
+    try:
+        supabase.table("documents").select("id").limit(1).execute()
+    except Exception:
+        supa_ok = False
+
+    sen_health = None
+    sen_models = None
+    base = senopati_base.rstrip("/") if senopati_base else ""
+    try:
+        if base:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                rh = await client.get(f"{base}/health")
+                if rh.status_code < 400:
+                    sen_health = rh.json()
+                rm = await client.get(f"{base}/models")
+                if rm.status_code < 400:
+                    j = rm.json()
+                    arr = j.get("models") if isinstance(j, dict) else None
+                    if isinstance(arr, list):
+                        sen_models = arr[:10]
+    except Exception as e:
+        sen_health = {"error": str(e)}
+
+    return {
+        "service": "LearnWAI RAG App",
+        "version": APP_VERSION,
+        "time_utc": now,
+        "llm": {
+            "provider": provider,
+            "senopati_host": senopati_host,
+            "model": senopati_model,
+        },
+        "supabase": {
+            "url_host": supa_host,
+            "reachable": supa_ok,
+            "bucket": BUCKET_NAME,
+        },
+        "senopati": {
+            "health": sen_health,
+            "models": sen_models,
+        },
+    }

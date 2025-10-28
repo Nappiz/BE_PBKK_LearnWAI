@@ -9,7 +9,7 @@ MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 TEMP = float(os.getenv("GEN_TEMPERATURE", "0.2"))
 TOP_P = float(os.getenv("GEN_TOP_P", "0.95"))
 TIMEOUT = float(os.getenv("REQUEST_TIMEOUT_S", "120"))
-SEED = int(os.getenv("GEN_SEED", "42"))  # untuk stabilitas hasil
+SEED = int(os.getenv("GEN_SEED", "42"))  
 
 def _raise_502(msg: str):
     raise HTTPException(status_code=502, detail=msg)
@@ -28,6 +28,30 @@ def _max_tokens() -> Optional[int]:
     except Exception:
         return 2048
 
+def _extract_text_flex(data):
+    """
+    Ambil teks dari berbagai kemungkinan format respons:
+    - {"text": "..."} atau {"output": "..."}
+    - OpenAI-like: {"choices":[{"message":{"content":"..."}}]}
+    - String polos
+    """
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    if isinstance(data, dict):
+        # varian paling umum
+        if isinstance(data.get("text"), str):
+            return data["text"]
+        if isinstance(data.get("output"), str):
+            return data["output"]
+        try:
+            return data["choices"][0]["message"]["content"]
+        except Exception:
+            pass
+        return str(data)
+    return str(data)
+
 async def generate(prompt: str, system: Optional[str]) -> Tuple[str, dict]:
     """
     Return (text, raw_json). No retry/fallback. Any non-2xx -> HTTP 502.
@@ -35,18 +59,89 @@ async def generate(prompt: str, system: Optional[str]) -> Tuple[str, dict]:
     try:
         mx = _max_tokens()
 
+        # ====================
+        #  SENOPATI (no auth)
+        # ====================
+        if PROVIDER == "senopati":
+            base = os.getenv("SENOPATI_BASE_URL", "").rstrip("/")
+            if not base:
+                _raise_502("Missing SENOPATI_BASE_URL")
+
+            senopati_model = os.getenv("LLM_MODEL", "").strip()
+            if not senopati_model:
+                senopati_model = "qwen2.5:14b"  
+
+            url = f"{base}/generate"
+
+            merged = (system + "\n\n" + prompt) if system else prompt
+
+            options = {
+                "temperature": TEMP,
+                "top_p": TOP_P,
+                "seed": SEED,
+            }
+            mx = _max_tokens()
+            if mx is not None:
+                options["num_predict"] = mx
+
+            payload = {
+                "model": senopati_model,
+                "prompt": merged,
+                "stream": False, # minta non-stream biar 1x respons
+                "options": options,
+            }
+
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+
+            async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+                r = await client.post(url, json=payload, headers=headers)
+            if r.status_code >= 400:
+                _raise_502(f"senopati: {r.text}")
+
+            try:
+                data = r.json()
+            except Exception:
+                data = r.text
+
+            def _extract_text_flex(data):
+                if data is None:
+                    return ""
+                if isinstance(data, str):
+                    return data
+                if isinstance(data, dict):
+                    for k in ("text", "output", "response"):
+                        if isinstance(data.get(k), str):
+                            return data[k]
+                    try:
+                        return data["choices"][0]["message"]["content"]
+                    except Exception:
+                        pass
+                    return str(data)
+                return str(data)
+
+            text = _extract_text_flex(data)
+            return text, (data if isinstance(data, dict) else {"text": text})
+
+        # ====================
+        #  OPENAI
+        # ====================
         if PROVIDER == "openai":
             key = os.getenv("OPENAI_API_KEY", "")
             if not key:
                 _raise_502("Missing OPENAI_API_KEY")
 
-            url = "https://api.openai.com/v1/chat/completions"
+            base = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+            url = f"{base}/chat/completions"
+
             payload = {
                 "model": MODEL,
                 "messages": _system_user_messages(system, prompt),
                 "temperature": TEMP,
                 "top_p": TOP_P,
-                "seed": SEED,  # OpenAI mendukung seed
+                "seed": SEED,  
             }
             if mx is not None:
                 payload["max_tokens"] = mx
@@ -58,10 +153,13 @@ async def generate(prompt: str, system: Optional[str]) -> Tuple[str, dict]:
                 _raise_502(f"openai: {r.text}")
 
             data = r.json()
-            text = data["choices"][0]["message"]["content"]
+            text = _extract_text_flex(data)
             return text, data
 
-        elif PROVIDER == "gemini":
+        # ====================
+        #  GEMINI
+        # ====================
+        if PROVIDER == "gemini":
             key = os.getenv("GEMINI_API_KEY", "")
             if not key:
                 _raise_502("Missing GEMINI_API_KEY")
@@ -72,7 +170,7 @@ async def generate(prompt: str, system: Optional[str]) -> Tuple[str, dict]:
             gen_cfg = {
                 "temperature": TEMP,
                 "topP": TOP_P,
-                "candidateCount": 1,  # bantu konsistensi
+                "candidateCount": 1,
             }
             if mx is not None:
                 gen_cfg["maxOutputTokens"] = mx
@@ -96,11 +194,13 @@ async def generate(prompt: str, system: Optional[str]) -> Tuple[str, dict]:
                 _raise_502(f"gemini bad response: {data}")
             return text, data
 
-        elif PROVIDER == "ollama":
+        # ====================
+        #  OLLAMA
+        # ====================
+        if PROVIDER == "ollama":
             base = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
             url = f"{base}/api/chat"
 
-            # Opsi deterministik untuk Ollama
             options = {
                 "temperature": TEMP,
                 "top_p": TOP_P,
@@ -125,8 +225,7 @@ async def generate(prompt: str, system: Optional[str]) -> Tuple[str, dict]:
             text = data.get("message", {}).get("content", "")
             return text, data
 
-        else:
-            _raise_502(f"Unknown LLM_PROVIDER={PROVIDER}")
+        _raise_502(f"Unknown LLM_PROVIDER={PROVIDER}")
 
     except HTTPException:
         raise
