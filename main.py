@@ -878,6 +878,9 @@ async def health():
     senopati_base = os.getenv("SENOPATI_BASE_URL", "")
     senopati_host = urlparse(senopati_base).netloc if senopati_base else ""
     senopati_model = os.getenv("SENOPATI_MODEL", os.getenv("LLM_MODEL", ""))
+    backend_emb = os.getenv("EMB_BACKEND", "unknown")
+    model_emb = os.getenv("EMB_MODEL", "")
+    hf_emb_model = os.getenv("HF_EMB_MODEL", "")
 
     supa_host = urlparse(SUPABASE_URL).netloc if SUPABASE_URL else ""
     supa_ok = True
@@ -912,6 +915,9 @@ async def health():
             "provider": provider,
             "senopati_host": senopati_host,
             "model": senopati_model,
+            "emb_be": backend_emb,
+            "emb_model": model_emb,
+            "hf_emb_model": hf_emb_model,
         },
         "supabase": {
             "url_host": supa_host,
