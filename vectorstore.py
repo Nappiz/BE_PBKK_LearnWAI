@@ -71,7 +71,10 @@ async def embed_texts(texts: List[str]) -> np.ndarray:
 
         model_id = _resolve_hf_model_id()
         model_id_enc = urllib.parse.quote(model_id, safe='-_/')
-        url = f"https://router.huggingface.co/hf-inference/{model_id_enc}"
+        url = (
+            "https://router.huggingface.co/"
+            f"hf-inference/models/{model_id_enc}/pipeline/feature-extraction"
+            )
         headers = {
             "Authorization": f"Bearer {key}",
             "Accept": "application/json",
