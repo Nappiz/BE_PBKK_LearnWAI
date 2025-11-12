@@ -9,10 +9,12 @@ MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 TEMP = float(os.getenv("GEN_TEMPERATURE", "0.2"))
 TOP_P = float(os.getenv("GEN_TOP_P", "0.95"))
 TIMEOUT = float(os.getenv("REQUEST_TIMEOUT_S", "120"))
-SEED = int(os.getenv("GEN_SEED", "42"))  
+SEED = int(os.getenv("GEN_SEED", "42"))
+
 
 def _raise_502(msg: str):
     raise HTTPException(status_code=502, detail=msg)
+
 
 def _system_user_messages(system: Optional[str], prompt: str):
     msgs = []
@@ -21,12 +23,14 @@ def _system_user_messages(system: Optional[str], prompt: str):
     msgs.append({"role": "user", "content": prompt})
     return msgs
 
+
 def _max_tokens() -> Optional[int]:
     try:
         v = int(os.getenv("GEN_MAX_TOKENS", "2048"))
         return v if v > 0 else None
     except Exception:
         return 2048
+
 
 def _extract_text_flex(data):
     """
@@ -40,7 +44,6 @@ def _extract_text_flex(data):
     if isinstance(data, str):
         return data
     if isinstance(data, dict):
-        # varian paling umum
         if isinstance(data.get("text"), str):
             return data["text"]
         if isinstance(data.get("output"), str):
@@ -52,6 +55,7 @@ def _extract_text_flex(data):
         return str(data)
     return str(data)
 
+
 async def generate(prompt: str, system: Optional[str]) -> Tuple[str, dict]:
     """
     Return (text, raw_json). No retry/fallback. Any non-2xx -> HTTP 502.
@@ -60,35 +64,33 @@ async def generate(prompt: str, system: Optional[str]) -> Tuple[str, dict]:
         mx = _max_tokens()
 
         # ====================
-        #  SENOPATI (no auth)
+        #  SENOPATI
         # ====================
         if PROVIDER == "senopati":
             base = os.getenv("SENOPATI_BASE_URL", "").rstrip("/")
             if not base:
                 _raise_502("Missing SENOPATI_BASE_URL")
 
-            senopati_model = os.getenv("LLM_MODEL", "").strip()
-            if not senopati_model:
-                senopati_model = "qwen2.5:14b"  
-
+            senopati_model = os.getenv("LLM_MODEL", "").strip() or "qwen2.5:14b"
             url = f"{base}/generate"
 
+            # Gabung system + user ke satu prompt, karena /generate cuma punya "prompt"
             merged = (system + "\n\n" + prompt) if system else prompt
 
-            options = {
-                "temperature": TEMP,
-                "top_p": TOP_P,
-                "seed": SEED,
-            }
-            mx = _max_tokens()
-            if mx is not None:
-                options["num_predict"] = mx
+            # Untuk Senopati: max_tokens=0 -> pakai default server
+            try:
+                max_tokens = int(os.getenv("GEN_MAX_TOKENS", "0") or "0")
+            except Exception:
+                max_tokens = 0
+            if max_tokens < 0:
+                max_tokens = 0
 
             payload = {
                 "model": senopati_model,
                 "prompt": merged,
-                "stream": False, # minta non-stream biar 1x respons
-                "options": options,
+                "temperature": TEMP,
+                "max_tokens": max_tokens,
+                "stream": False,
             }
 
             headers = {
@@ -98,32 +100,29 @@ async def generate(prompt: str, system: Optional[str]) -> Tuple[str, dict]:
 
             async with httpx.AsyncClient(timeout=TIMEOUT) as client:
                 r = await client.post(url, json=payload, headers=headers)
+
             if r.status_code >= 400:
                 _raise_502(f"senopati: {r.text}")
 
             try:
                 data = r.json()
             except Exception:
-                data = r.text
+                # kalau server bener-bener balikin plain string
+                text = r.text
+                return text, {"text": text, "raw": r.text}
 
-            def _extract_text_flex(data):
-                if data is None:
-                    return ""
-                if isinstance(data, str):
-                    return data
-                if isinstance(data, dict):
-                    for k in ("text", "output", "response"):
-                        if isinstance(data.get(k), str):
-                            return data[k]
-                    try:
-                        return data["choices"][0]["message"]["content"]
-                    except Exception:
-                        pass
-                    return str(data)
-                return str(data)
+            # *** DI SINI KUNCI NYA ***
+            if isinstance(data, dict):
+                # API Senopati sekarang: {"model": "...", "response": "...", "done": true, "context": [...]}
+                text = data.get("response")
+                if not isinstance(text, str):
+                    # fallback kalau someday schema berubah lagi
+                    text = data.get("text") or data.get("output") or _extract_text_flex(data)
+                return text, data
 
+            # Kalau ternyata JSON-nya bukan dict (aneh banget, tapi yaudah)
             text = _extract_text_flex(data)
-            return text, (data if isinstance(data, dict) else {"text": text})
+            return text, {"text": text, "raw": data}
 
         # ====================
         #  OPENAI
@@ -141,7 +140,7 @@ async def generate(prompt: str, system: Optional[str]) -> Tuple[str, dict]:
                 "messages": _system_user_messages(system, prompt),
                 "temperature": TEMP,
                 "top_p": TOP_P,
-                "seed": SEED,  
+                "seed": SEED,
             }
             if mx is not None:
                 payload["max_tokens"] = mx

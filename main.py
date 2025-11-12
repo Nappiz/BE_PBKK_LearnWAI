@@ -190,6 +190,155 @@ def _extract_pdf_text(data: bytes) -> str:
             if t: parts.append(t)
         return "\n".join(parts)
 
+VISION_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT_S", "120"))
+
+
+def _extract_text_generic(data):
+    """
+    Helper kecil buat narik teks dari berbagai bentuk respons:
+    - string langsung
+    - {"response": "..."} / {"text": "..."} / {"output": "..."}
+    - fallback: str(data)
+    """
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    if isinstance(data, dict):
+        for k in ("response", "text", "output"):
+            v = data.get(k)
+            if isinstance(v, str):
+                return v
+        return str(data)
+    return str(data)
+
+
+async def _extract_vision_from_pdf(raw_pdf: bytes) -> str:
+    """
+    Kirim PDF ke Senopati /vision/pdf untuk baca konten visual (gambar/tabel).
+    Return: string deskripsi (bisa kosong kalau gagal).
+    """
+    base = os.getenv("SENOPATI_BASE_URL", "").rstrip("/")
+    if not base:
+        return ""
+
+    model = os.getenv("SENOPATI_VISION_MODEL", "qwen2.5vl:7b")
+    prompt = os.getenv(
+        "SENOPATI_VISION_PROMPT",
+        "Describe the content of this document",
+    )
+
+    try:
+        temperature = float(os.getenv("VISION_TEMPERATURE", "0.7"))
+    except Exception:
+        temperature = 0.7
+
+    try:
+        max_tokens = int(os.getenv("VISION_MAX_TOKENS", "0") or "0")
+    except Exception:
+        max_tokens = 0
+
+    dpi = int(os.getenv("VISION_DPI", "150"))
+    max_image_size = int(os.getenv("VISION_MAX_IMAGE_SIZE", "1024"))
+    image_quality = int(os.getenv("VISION_IMAGE_QUALITY", "85"))
+    save_images = os.getenv("VISION_SAVE_IMAGES", "true").lower() == "true"
+
+    max_pages_env = os.getenv("VISION_MAX_PAGES", "").strip()
+    max_pages = int(max_pages_env) if max_pages_env else None
+
+    params = {
+        "model": model,
+        "prompt": prompt,
+        "temperature": temperature,
+        "dpi": dpi,
+        "max_image_size": max_image_size,
+        "image_quality": image_quality,
+        "save_images": save_images,
+    }
+    if max_tokens > 0:
+        params["max_tokens"] = max_tokens
+    if max_pages is not None:
+        params["max_pages"] = max_pages
+
+    files = {
+        "pdf": ("document.pdf", raw_pdf, "application/pdf"),
+    }
+
+    url = f"{base}/vision/pdf"
+
+    try:
+        async with httpx.AsyncClient(timeout=VISION_TIMEOUT) as client:
+            r = await client.post(url, params=params, files=files)
+    except Exception as e:
+        print(f"[vision] request failed: {e}", flush=True)
+        return ""
+
+    if r.status_code >= 400:
+        print(f"[vision] bad status {r.status_code}: {r.text}", flush=True)
+        return ""
+
+    try:
+        data = r.json()
+    except Exception:
+        return r.text
+
+    return _extract_text_generic(data)
+
+# ==== PDF -> image previews untuk tampilan di FE ====
+def _generate_page_previews(doc_id: str, raw_pdf: bytes) -> list[str]:
+    """
+    Render setiap halaman PDF menjadi PNG, upload ke Supabase storage,
+    dan return list public URL-nya.
+
+    Kalau gagal (pdf2image/poppler gak ada, dsb) -> return [].
+    """
+    try:
+        from pdf2image import convert_from_bytes
+    except Exception as e:
+        print(f"[pdf-previews] pdf2image import failed: {e}", flush=True)
+        return []
+
+    try:
+        dpi = int(os.getenv("PDF_IMG_DPI", "120"))
+        pages = convert_from_bytes(raw_pdf, dpi=dpi)
+    except Exception as e:
+        print(f"[pdf-previews] convert_from_bytes failed: {e}", flush=True)
+        return []
+
+    urls: list[str] = []
+    for idx, page in enumerate(pages, start=1):
+        try:
+            buf = io.BytesIO()
+            page.save(buf, format="PNG")
+            data = buf.getvalue()
+        except Exception as e:
+            print(f"[pdf-previews] save page {idx} failed: {e}", flush=True)
+            continue
+
+        path = f"previews/{doc_id}/page-{idx}.png"
+
+        try:
+            res = supabase.storage.from_(BUCKET_NAME).upload(
+                path,
+                data,
+                {
+                    "content-type": "image/png",
+                    "cache-control": "public, max-age=31536000",
+                    "upsert": "true",
+                },
+            )
+            if isinstance(res, dict) and res.get("error"):
+                print(f"[pdf-previews] upload error for {path}: {res['error']}", flush=True)
+                continue
+
+            url = supabase.storage.from_(BUCKET_NAME).get_public_url(path)
+            urls.append(url)
+        except Exception as e:
+            print(f"[pdf-previews] upload failed for {path}: {e}", flush=True)
+            continue
+
+    return urls
+
 def normalize_text(s: str) -> str:
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
@@ -442,29 +591,48 @@ async def _pipeline_process(job_id: str, doc_id: str, title: str, raw: bytes):
     try:
         clear_store(doc_id)
         _set_status(job_id, "extract", 10, "Extracting PDF…", doc_id=doc_id)
-        text = _extract_pdf_text(raw)
+        text_plain = _extract_pdf_text(raw)
 
         _set_status(job_id, "normalize", 20, "Normalizing…", doc_id=doc_id)
-        text = normalize_text(text)
+        text_plain = normalize_text(text_plain)
 
-        _set_status(job_id, "split", 35, "Chunking…", doc_id=doc_id)
-        chunks = chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP, MIN_CHARS_PER_CHUNK)
+        _set_status(job_id, "vision", 30, "Analyzing images…", doc_id=doc_id)
+        vision_notes = await _extract_vision_from_pdf(raw) 
+
+        if vision_notes:
+            full_text = text_plain + "\n\n[CATATAN VISUAL]\n" + vision_notes
+        else:
+            full_text = text_plain
+
+        _set_status(job_id, "split", 40, "Chunking…", doc_id=doc_id)
+        chunks = chunk_text(full_text, CHUNK_SIZE, CHUNK_OVERLAP, MIN_CHARS_PER_CHUNK)
         if not chunks:
             raise HTTPException(status_code=400, detail="Document too short after normalization")
 
         _set_status(job_id, "embedding", 60, "Embedding & indexing…", doc_id=doc_id)
         await asyncio.shield(add_texts(chunks, doc_id))
 
+        _set_status(job_id, "images", 70, "Generating page previews…", doc_id=doc_id)
+        image_urls = _generate_page_previews(doc_id, raw)
+
         _set_status(job_id, "embedding", 80, "Generating summary…", doc_id=doc_id)
         try:
-            sum_res: SummarizeResponse = await summarize(SummarizeRequest(query="ringkas dokumen ini"), doc_id=doc_id, internal=True)  # type: ignore
+            sum_res: SummarizeResponse = await summarize(
+                SummarizeRequest(query="ringkas dokumen ini"),
+                doc_id=doc_id,
+                internal=True,  
+            )
             summary_text = sum_res.text
         except Exception as e:
             summary_text = f"(summary failed: {e})"
 
         _set_status(job_id, "embedding", 88, "Generating flashcards…", doc_id=doc_id)
         try:
-            fc_res: FlashcardsResponse = await flashcards(FlashcardsRequest(question_hint=None), doc_id=doc_id, internal=True)  # type: ignore
+            fc_res: FlashcardsResponse = await flashcards(
+                FlashcardsRequest(question_hint=None),
+                doc_id=doc_id,
+                internal=True,  
+            )
             flashcards_json = [c.dict() for c in fc_res.cards]
         except Exception as e:
             flashcards_json = [{"question": "Generation failed", "answer": str(e)}]
@@ -473,6 +641,7 @@ async def _pipeline_process(job_id: str, doc_id: str, title: str, raw: bytes):
             "status": "ready",
             "summary": summary_text,
             "flashcards": flashcards_json,
+            "image_urls": image_urls,  
         }).eq("id", doc_id).execute()
 
         _set_status(job_id, "done", 100, "Ready", ok=True, doc_id=doc_id)
@@ -521,7 +690,6 @@ def update_document(doc_id: str, body: UpdateDocumentIn):
         if len(title) > 300:
             raise HTTPException(status_code=400, detail="Title too long")
         updates["title"] = title
-        # NOTE: sengaja tidak mengubah slug agar permalink lama tetap valid
     if not updates:
         return {"ok": True, "data": row}
     res = supabase.table("documents").update(updates).eq("id", doc_id).execute()
@@ -533,25 +701,20 @@ def delete_document(doc_id: str):
     if not row:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    # 1) delete from storage (best-effort)
     p = _extract_path_from_public_url(row.get("url"))
     try:
         if p:
             supabase.storage.from_(BUCKET_NAME).remove([p])
     except Exception as e:
-        # Jangan fail hard kalau storage remove error – tetap lanjut hapus row
         print(f"[storage] remove failed for {p}: {e}", flush=True)
 
-    # 2) clear vector index (best-effort)
     try:
         clear_store(doc_id)
     except Exception as e:
         print(f"[vectorstore] clear_store({doc_id}) failed: {e}", flush=True)
 
-    # 3) delete DB row
     supabase.table("documents").delete().eq("id", doc_id).execute()
 
-    # 4) optional: hapus jobs yang terkait (best-effort)
     try:
         supabase.table("jobs").delete().eq("doc_id", doc_id).execute()
     except Exception:
