@@ -4,7 +4,8 @@ load_dotenv()
 
 import os, re, io, asyncio, logging, secrets, bcrypt, unicodedata
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from uuid import uuid4
 from urllib.parse import urlparse
 import httpx
@@ -758,10 +759,13 @@ def _strip_end_tag(s: str) -> str:
 
 async def _safe_generate(prompt: str, system: str) -> str:
     END_TAG = "[END]"
+
     limiting_hint = (
-        "\n\nBatas keras: maksimal ~700 kata. Stop segera sebelum melebihi batas. "
-        f"Tutup jawaban dengan token {END_TAG}"
+        "\n\nTulislah jawaban yang PANJANG dan padat informasi selama konteks masih relevan. "
+        "Jika ruang masih cukup, lanjutkan sampai materi terasa tuntas. "
+        f"Jika benar-benar selesai, akhiri dengan token {END_TAG}."
     )
+
     try:
         text, _meta = await providers.generate(prompt + limiting_hint, system)
         return _strip_end_tag(text)
@@ -783,59 +787,114 @@ async def _safe_generate(prompt: str, system: str) -> str:
 def _looks_truncated(txt: str) -> bool:
     if not txt:
         return False
-    tail = txt[-220:].strip()
-    return not any(tail.endswith(p) for p in (".", "!", "?", ".”", "!”", "?”")) and len(txt) > 600
+    tail = txt[-260:].strip()
+    return not any(tail.endswith(p) for p in (".", "!", "?", ".”", "!”", "?”")) and len(txt) > 800
 
-async def _generate_with_continue(prompt: str, system: str, hops: int = 1) -> str:
+
+async def _generate_with_continue(prompt: str, system: str, hops: int = 2) -> str:
     END_TAG = "[END]"
     combined = ""
     for i in range(max(1, hops + 1)):
         base = (
             prompt if i == 0 else
-            prompt + "\n\nLANJUTKAN dari kalimat terakhir tanpa mengulang. Tetap EKSTRAKTIF."
+            prompt + "\n\nLANJUTKAN dari kalimat TERAKHIR tanpa mengulang isi sebelumnya. "
+                     "Fokus pada bagian konteks yang belum tersentuh dan tetap EKSTRAKTIF."
         )
-        limiter = (
-            "\n\nBatas keras: maksimal ~500 kata untuk bagian ini. "
-            f"Tutup jawaban dengan token {END_TAG}"
+        part_hint = (
+            "\n\nUsahakan bagian ini cukup panjang (bisa sekitar 700–1000 kata) "
+            f"selama konteks mendukung. Akhiri dengan {END_TAG} bila bagian ini sudah selesai."
         )
-        piece = await _safe_generate(base + limiter, system)
+        piece = await _safe_generate(base + part_hint, system)
         piece = _strip_end_tag(piece)
+
         if i == 0:
             combined = piece
         else:
             combined = (combined.rstrip() + "\n\n" + piece.lstrip()).strip()
+
         if not _looks_truncated(piece):
             break
+
     return combined
 
 # ====== STUDY-SUMMARIZER ======
 def _study_block_prompt(contexts: List[str]) -> Tuple[str, str]:
     system = (
-        "Anda adalah peringkas EKSTRAKTIF untuk bahan belajar. "
-        "Gunakan HANYA kalimat/angka dari KONTEKS. Dilarang menambah fakta baru."
+        "Anda adalah asisten belajar tingkat profesional untuk platform pembelajaran bernama LearnWAI. "
+        "Target pembaca adalah mahasiswa yang ingin benar-benar memahami materi, bukan sekadar hafal. "
+        "Tugas Anda: menyusun CATATAN BELAJAR PANJANG yang:\n"
+        "- BERBASIS EKSTRAKSI: gunakan HANYA informasi dari konteks, boleh parafrase untuk kejelasan, "
+        "  tetapi dilarang menambah fakta baru.\n"
+        "- STRUKTUR JELAS: alur mengalir, ada pengenalan → penjabaran konsep → hubungan antar konsep → rekap singkat.\n"
+        "- RAMAH PEMULA: jelaskan istilah kunci, rumus, dan langkah prosedural dengan bahasa yang bisa dicerna mahasiswa.\n"
+        "- SIAP UJIAN: fokus pada hal yang akan benar-benar membantu saat ujian atau saat mengerjakan soal.\n"
+        "\n"
+        "Gaya bahasa: profesional, jelas, tenang, dan terarah. Hindari kalimat yang terlalu bertele-tele tanpa isi."
     )
+
     prompt = (
-        "KONTEKS:\n" + "\n---\n".join(contexts) +
-        "\n\nTULIS rangkuman belajar bergaya NARATIF yang komprehensif, mengalir, dan mudah diikuti. "
-        "Tidak harus berupa daftar. Boleh subjudul seperlunya (opsional). "
-        "Fokus pada hal penting untuk persiapan ujian: konsep & definisi kunci (dengan penjelasan ringkas), "
-        "rumus/teorema & kapan digunakan, fakta/timeline penting, hubungan sebab-akibat utama, contoh representatif, "
-        "serta miskonsepsi umum bila tersirat di konteks. Tetap EKSTRAKTIF (boleh kutip frasa 2–10 kata)."
+        "KONTEKS SUMBER (JANGAN disalin mentah, gunakan sebagai bahan):\n"
+        + "\n---\n".join(contexts)
+        + "\n\n"
+        "TULIS SATU CATATAN BELAJAR KOMPREHENSIF berdasarkan konteks di atas.\n"
+        "Tujuan catatan ini:\n"
+        "- Bisa dibaca dari awal sampai akhir seperti \"mini-modul\" atau bab ringkas.\n"
+        "- Membantu pembaca memahami *kenapa* suatu konsep penting, bukan hanya apa definisinya.\n"
+        "\n"
+        "Instruksi penulisan:\n"
+        "1) Mulai dengan paragraf pembuka singkat yang menjelaskan topik utama dokumen dan konteks umumnya.\n"
+        "2) Jelaskan konsep-konsep kunci satu per satu dalam paragraf yang runtut. Untuk setiap konsep penting:\n"
+        "   - Sebutkan definisi atau ide utamanya.\n"
+        "   - Jelaskan peran/fungsinya dalam topik besar.\n"
+        "   - Jika ada langkah, tahapan, atau proses, jelaskan urutannya dengan kata-kata (tidak harus bernomor).\n"
+        "3) Jika konteks mengandung rumus, notasi matematika, atau ekspresi formal:\n"
+        "   - Tulis ulang rumus tersebut memakai LaTeX di dalam `$...$` atau `$$...$$`.\n"
+        "   - Beri keterangan singkat: apa arti tiap simbol dan kapan rumus itu digunakan.\n"
+        "   - Contoh: tuliskan `y = \\tan\\left(\\frac{\\pi}{180} \\times \\frac{a}{60}\\right) \\times w + x` "
+        "     di dalam `$...$` agar dapat dirender dengan baik.\n"
+        "4) Jika konteks berisi contoh, studi kasus, ilustrasi numerik, atau diagram yang dijelaskan dengan kata-kata:\n"
+        "   - Ringkas inti contoh tersebut.\n"
+        "   - Jelaskan apa pelajaran yang bisa diambil dari contoh itu.\n"
+        "5) Jika tampak ada miskonsepsi umum, batasan, atau catatan penting (warning) di dalam konteks:\n"
+        "   - Jelaskan dengan bahasa sederhana agar pembaca tidak salah paham.\n"
+        "6) Tutup dengan rekap singkat yang merangkum poin paling penting yang perlu diingat untuk ujian atau praktik.\n"
+        "\n"
+        "Format keluaran:\n"
+        "- Gunakan paragraf-paragraf mengalir, boleh memakai subjudul singkat (misalnya dengan `##` atau `###`) "
+        "  untuk memecah bagian, tetapi TIDAK wajib.\n"
+        "- Hindari daftar bernomor kaku (1., 2., 3.) kecuali benar-benar diperlukan untuk menjelaskan urutan langkah.\n"
+        "- Prioritaskan kedalaman dan koneksi antar ide dibanding sekadar daftar poin pendek.\n"
+        "\n"
+        "Ingat: jangan menambah contoh, rumus, atau fakta yang tidak muncul di KONTEKS. "
+        "Lebih baik jujur bahwa informasi tidak ada daripada mengarang."
     )
     return prompt, system
 
 def _study_merge_prompt(partials: List[str]) -> Tuple[str, str]:
     system = (
-        "Anda adalah penyusun rangkuman belajar akhir. Tetap EKSTRAKTIF dari bahan parsial, "
-        "gabungkan, hilangkan duplikasi, rapikan alur, dan konsistensi istilah. "
-        "Jangan menambah fakta baru."
+        "Anda adalah editor utama catatan belajar untuk platform LearnWAI. "
+        "Tugas Anda menggabungkan beberapa rangkuman parsial menjadi SATU catatan belajar akhir yang rapi, "
+        "konsisten, dan enak dipelajari. Anda harus tetap EKSTRAKTIF dari rangkuman parsial tersebut "
+        "dan tidak menambah fakta baru."
     )
+
     prompt = (
-        "BERIKUT KUMPULAN RANGKUMAN PARSIAL:\n\n" +
-        "\n\n===== PARTIAL =====\n\n".join(partials) +
-        "\n\nSUSUN SATU rangkuman belajar AKHIR bergaya NARATIF yang utuh, jelas, dan mudah dipelajari. "
-        "Bebas format (tidak harus daftar). Boleh paragraf/subjudul seperlunya. "
-        "Pastikan memuat item penting untuk ujian dan akhiri dengan rekap singkat."
+        "BERIKUT BEBERAPA RANGKUMAN PARSIAL YANG PERLU DIGABUNGKAN:\n\n"
+        + "\n\n===== RANGKUMAN PARSIAL =====\n\n".join(partials)
+        + "\n\n"
+        "TUGAS ANDA:\n"
+        "- Gabungkan semua rangkuman parsial menjadi SATU catatan belajar utuh.\n"
+        "- Hilangkan pengulangan yang tidak perlu, rapikan alur ide agar mengalir dari dasar → lanjut.\n"
+        "- Samakan istilah (jangan sampai satu konsep disebut dengan banyak nama berbeda tanpa penjelasan).\n"
+        "- Pertahankan detail penting, contoh representatif, dan rumus yang relevan.\n"
+        "- Jika ada rumus dalam teks parsial, tulis ulang dengan LaTeX di dalam `$...$` atau `$$...$$`.\n"
+        "\n"
+        "HASIL AKHIR yang diinginkan:\n"
+        "- Satu teks naratif panjang yang bisa dibaca seperti bab ringkas.\n"
+        "- Boleh memakai subjudul seperlunya, tetapi tidak wajib.\n"
+        "- Di bagian akhir, buat rekap singkat 1–3 paragraf yang merangkum inti materi.\n"
+        "\n"
+        "JANGAN menambah informasi baru di luar yang sudah ada di rangkuman parsial."
     )
     return prompt, system
 
@@ -853,17 +912,18 @@ async def summarize(
     did = _resolve_doc_id(doc_id, slug, allow_not_ready=internal, user_id=user_id)
     query = (req.query or "ringkas dokumen ini").strip()
 
-    results = await search(query, did, top_k=28)
+    results = await search(query, did, top_k=40)
 
     contexts_pool = _pick_contexts(
         results=results,
-        min_sim=0.24,
-        max_chunks=10,
-        char_budget=9000
+        min_sim=0.22,      
+        max_chunks=14,     
+        char_budget=14000  
     )
 
-    BATCH_SIZE = 3
+    BATCH_SIZE = 4        
     MAX_GROUPS = 3
+
     batches: List[List[str]] = []
     cur: List[str] = []
     for t in contexts_pool:
@@ -878,20 +938,27 @@ async def summarize(
     partials: List[str] = []
     for b in batches:
         p, s = _study_block_prompt(b)
-        part = await _generate_with_continue(p, s, hops=1)
+        part = await _generate_with_continue(p, s, hops=2)
         partials.append(part.strip())
 
     if not partials:
-        contexts = _pick_contexts(results=results, min_sim=0.22, max_chunks=5, char_budget=6000)
+        contexts = _pick_contexts(
+            results=results,
+            min_sim=0.20,
+            max_chunks=8,
+            char_budget=12000
+        )
         p, s = _study_block_prompt(contexts)
-        text = await _generate_with_continue(p, s, hops=1)
+        text = await _generate_with_continue(p, s, hops=2)
         ragas = _ragas_or_none(query, text, contexts)
         if ragas is None and run_ragas_eval is not None:
-            ragas = await run_ragas_eval(question=query, answer=text, contexts=contexts, ground_truth=None)
+            ragas = await run_ragas_eval(
+                question=query, answer=text, contexts=contexts, ground_truth=None
+            )
         return SummarizeResponse(text=text, contexts=contexts, ragas=RagasScores(**ragas))
 
     merge_prompt, merge_system = _study_merge_prompt(partials)
-    final_text = await _generate_with_continue(merge_prompt, merge_system, hops=1)
+    final_text = await _generate_with_continue(merge_prompt, merge_system, hops=2)
 
     used_contexts = _dedup([t for b in batches for t in b])
 
@@ -1041,11 +1108,13 @@ async def flashcards(
 # =====================================
 @app.get("/health")
 async def health():
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(ZoneInfo("Asia/Jakarta"))
+    nowformatted = now.strftime("%Y-%m-%d / %H:%M:%S")
     provider = os.getenv("LLM_PROVIDER", "unknown")
     senopati_base = os.getenv("SENOPATI_BASE_URL", "")
     senopati_host = urlparse(senopati_base).netloc if senopati_base else ""
     senopati_model = os.getenv("SENOPATI_MODEL", os.getenv("LLM_MODEL", ""))
+    senopati_vision_model = os.getenv("SENOPATI_VISION_MODEL", "")
     backend_emb = os.getenv("EMB_BACKEND", "unknown")
     model_emb = os.getenv("EMB_MODEL", "")
     hf_emb_model = os.getenv("HF_EMB_MODEL", "")
@@ -1076,15 +1145,15 @@ async def health():
         sen_health = {"error": str(e)}
 
     return {
-        "service": "LearnWAI RAG App",
-        "version": APP_VERSION,
-        "time_utc": now,
+        "service": "LearnWAI",
+        "time": nowformatted,
         "llm": {
             "provider": provider,
             "senopati_host": senopati_host,
             "model": senopati_model,
-            "emb_be": backend_emb,
-            "emb_model": model_emb,
+            "vision_model": senopati_vision_model,
+            "embedding": backend_emb,
+            "embedding_model": model_emb,
             "hf_emb_model": hf_emb_model,
         },
         "supabase": {
