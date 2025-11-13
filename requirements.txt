@@ -11,7 +11,7 @@ PyJWT==2.10.1
 supabase==2.20.0
 supabase-auth==2.24.0
 storage3==2.20.0
-postgrest-py==0.16.0
+postgrest==2.20.0
 realtime==2.20.0
 
 PyPDF2==3.0.1
