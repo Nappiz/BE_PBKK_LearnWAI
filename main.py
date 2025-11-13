@@ -26,10 +26,15 @@ from vectorstore import add_texts, search, clear_store
 import providers
 
 RAGAS_ENABLED = os.getenv("RAGAS_ENABLED", "true").lower() == "true"
-if RAGAS_ENABLED:
-    from evaluation import run_ragas_eval
-else:
+try:
+    if RAGAS_ENABLED:
+        from evaluation import run_ragas_eval
+    else:
+        run_ragas_eval = None
+except Exception as e:
+    print(f"[RAGAS] disabled because import failed: {e}", flush=True)
     run_ragas_eval = None
+    RAGAS_ENABLED = False
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
