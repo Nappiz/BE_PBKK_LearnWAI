@@ -1,7 +1,6 @@
-import os, json, io, numpy as np
+import os, json, io
 from typing import List, Tuple, Optional
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import normalize
+import numpy as np
 import httpx
 from fastapi import HTTPException
 import urllib.parse
@@ -40,10 +39,19 @@ def _cfg():
         "EMB_BATCH_SIZE": int(os.getenv("EMB_BATCH_SIZE", "64")),
     }
 
-
+# ---------- NumPy-only helpers (ganti sklearn) ----------
 def _l2_normalize(arr: np.ndarray) -> np.ndarray:
-    return normalize(arr, norm="l2", axis=1)
+    # shape: (N, D)
+    denom = np.linalg.norm(arr, axis=1, keepdims=True)
+    denom[denom == 0] = 1.0
+    return arr / denom
 
+def _cosine_similarity_rowvec_to_matrix(rowvec: np.ndarray, mat: np.ndarray) -> np.ndarray:
+    # rowvec: (D,), mat: (N, D), return: (N,)
+    # asumsikan keduanya sudah L2-normalized
+    return (mat @ rowvec).astype(np.float32)
+
+# --------------------------------------------------------
 
 def _resolve_hf_model_id() -> str:
     m = (
@@ -99,7 +107,7 @@ async def embed_texts(texts: List[str]) -> np.ndarray:
         if arr.ndim != 2:
             _raise_502(f"HF embeddings: unexpected shape {arr.shape} (model='{model_id}')")
 
-        return _l2_normalize(arr).astype(np.float32)
+        return _l2_normalize(arr.astype(np.float32))
 
     elif backend == "openai":
         key = os.getenv("OPENAI_API_KEY", "")
@@ -133,7 +141,8 @@ async def embed_texts(texts: List[str]) -> np.ndarray:
             convert_to_numpy=True,
             show_progress_bar=False,
         )
-        return arr.astype(np.float32)
+        # Sudah normalized oleh ST, tapi kita pastikan:
+        return _l2_normalize(arr.astype(np.float32))
 
     else:
         _raise_502(f"Unknown EMB_BACKEND={backend}")
@@ -153,14 +162,9 @@ def _paths(doc_id: str) -> Tuple[str, str]:
 
 
 def clear_store(doc_id: Optional[str] = None):
-    """
-    - Jika doc_id diberikan: hapus semua file vector milik dokumen tsb di bucket 'vectors'.
-    - Jika None: NO-OP (hindari nge-wipe seluruh bucket dari kode).
-    """
     if not doc_id:
         return
     try:
-        # list semua file di "folder" doc_id
         files = supabase.storage.from_(VECTOR_BUCKET).list(doc_id)
         if not files:
             return
@@ -168,7 +172,6 @@ def clear_store(doc_id: Optional[str] = None):
         if paths:
             supabase.storage.from_(VECTOR_BUCKET).remove(paths)
     except Exception as e:
-        # jangan bikin request gagal cuma karena bersihin vector gagal
         print(f"[vectorstore] clear_store({doc_id}) failed: {e}", flush=True)
 
 
@@ -182,7 +185,6 @@ def save_vectors(embs: np.ndarray, texts: List[str], doc_id: str) -> None:
 
     p_emb, p_txt = _paths(doc_id)
 
-    # ---- upload embeddings.npy ----
     buf = io.BytesIO()
     np.save(buf, embs.astype(np.float32))
     buf.seek(0)
@@ -193,7 +195,7 @@ def save_vectors(embs: np.ndarray, texts: List[str], doc_id: str) -> None:
             {
                 "content-type": "application/octet-stream",
                 "cache-control": "no-cache",
-                "upsert": "true",   # <- STRING, bukan bool
+                "upsert": "true",
             },
         )
         if isinstance(res1, dict) and res1.get("error"):
@@ -201,7 +203,6 @@ def save_vectors(embs: np.ndarray, texts: List[str], doc_id: str) -> None:
     except Exception as e:
         _raise_502(f"Failed to upload embeddings to storage: {e}")
 
-    # ---- upload texts.jsonl ----
     lines = "\n".join(json.dumps({"text": t}, ensure_ascii=False) for t in texts)
     try:
         res2 = supabase.storage.from_(VECTOR_BUCKET).upload(
@@ -210,7 +211,7 @@ def save_vectors(embs: np.ndarray, texts: List[str], doc_id: str) -> None:
             {
                 "content-type": "application/json",
                 "cache-control": "no-cache",
-                "upsert": "true",   # <- sama di sini
+                "upsert": "true",
             },
         )
         if isinstance(res2, dict) and res2.get("error"):
@@ -256,15 +257,10 @@ def load_vectors(doc_id: str) -> Tuple[np.ndarray, List[str]]:
             detail="Belum ada dokumen terindeks. Silakan upload dulu."
         )
 
-    return embs, texts
+    return embs.astype(np.float32), texts
 
 
 async def add_texts(chunks: List[str], doc_id: str) -> None:
-    """
-    - Embed chunks baru
-    - Jika sudah ada vectorstore doc_id, append
-    - Simpan balik ke Supabase Storage
-    """
     new_embs = await embed_texts(chunks)
     try:
         embs, texts = load_vectors(doc_id)
@@ -276,8 +272,9 @@ async def add_texts(chunks: List[str], doc_id: str) -> None:
 
 
 async def search(query: str, doc_id: str, top_k: int = 4) -> List[Tuple[str, float]]:
-    embs, texts = load_vectors(doc_id)
+    embs, texts = load_vectors(doc_id)               
     q_emb = await embed_texts([query])
-    sims = cosine_similarity(q_emb, embs)[0]
+    q = q_emb[0]
+    sims = _cosine_similarity_rowvec_to_matrix(q, embs)  
     idxs = sims.argsort()[::-1][:top_k]
     return [(texts[i], float(sims[i])) for i in idxs]
