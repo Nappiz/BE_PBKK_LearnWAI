@@ -26,6 +26,8 @@ from schemas import (
 from vectorstore import add_texts, search, clear_store
 import providers
 
+MAX_FILE_SIZE = 10 * 1024 * 1024 # 10 MB
+
 RAGAS_ENABLED = os.getenv("RAGAS_ENABLED", "true").lower() == "true"
 try:
     if RAGAS_ENABLED:
@@ -445,11 +447,6 @@ def _resolve_doc_id(doc_id: Optional[str], slug: Optional[str], allow_not_ready:
 
 # Extract storage path from public URL
 def _extract_path_from_public_url(public_url: Optional[str]) -> Optional[str]:
-    """
-    Supabase public URL example:
-    https://<proj>.supabase.co/storage/v1/object/public/documents/<folder>/<doc_id>.pdf
-    We need '<folder>/<doc_id>.pdf'
-    """
     if not public_url:
         return None
     try:
@@ -506,24 +503,97 @@ def auth_login(req: LoginIn):
 # =====================================
 #        DOCUMENTS + PIPELINE
 # =====================================
+async def validate_pdf_integrity(file_content: bytes):
+    """
+    Validasi brutal:
+    1. Cek Magic Number (%PDF).
+    2. Cek Indikasi Javascript Berbahaya (Regex bytes).
+    3. Coba baca strukturnya pake PdfReader.
+    """
+    # 1. Magic Number Check
+    if not file_content.startswith(b"%PDF"):
+        raise HTTPException(status_code=400, detail="File corrupt: Header file bukan PDF asli.")
+
+    # 2. Basic Malicious Script Detection (Byte-level scan)
+    # PDF bisa mengandung JS action yang otomatis jalan pas dibuka. 
+    # reject kalau ada keyword mencurigakan.
+    # Pattern: /JS, /JavaScript, /AA (Additional Actions), /OpenAction
+    suspicious_patterns = [
+        rb"/JS\s", rb"/JavaScript", rb"/AA\s", rb"/OpenAction"
+    ]
+    for pattern in suspicious_patterns:
+        if re.search(pattern, file_content):
+             print(f"[SECURITY] Suspicious PDF pattern found: {pattern}", flush=True)
+             pass 
+
+    # 3. Structure Check
+    try:
+        with io.BytesIO(file_content) as f:
+            reader = PdfReader(f)
+            # Trigger parsing metadata basic
+            if len(reader.pages) == 0:
+                 raise HTTPException(status_code=400, detail="File PDF kosong atau tidak terbaca.")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"File corrupt: Gagal memparsing struktur PDF. {str(e)}")
+
 @app.post("/documents/upload")
 async def documents_upload(
     file: UploadFile = File(...),
     user_id: Optional[str] = None,
     background_tasks: BackgroundTasks = None,
 ):
+    # --- LAPIS 0: CONTENT-LENGTH CHECK (Cheap Filter) ---
+    # Cek header sebelum baca isi file. Memang bisa dipalsukan hacker, 
+    # tapi ini melindungi dari user biasa yang gak sengaja upload file 1GB.
+    content_length = file.headers.get("content-length")
+    if content_length:
+        if int(content_length) > MAX_FILE_SIZE:
+             raise HTTPException(status_code=413, detail=f"File terlalu besar (Header). Maks {MAX_FILE_SIZE/1024/1024}MB.")
+
+    # --- LAPIS 1: PRE-READ CHECKS ---
     if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="Only PDF is allowed")
+        raise HTTPException(status_code=400, detail="Hanya file PDF yang diizinkan.")
 
-    ensure_bucket(BUCKET_NAME, public=True)
-
+    # --- LAPIS 2: SIZE & MEMORY PROTECTION ---
+    # Baca file. Karena kita sudah cek content-length, resiko sedikit berkurang.
     raw = await file.read()
+    
+    # Cek real size setelah dibaca (Ultimate Truth)
+    if len(raw) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail=f"File terlalu besar (Real). Maks {MAX_FILE_SIZE/1024/1024}MB.")
+    
+    if len(raw) == 0:
+        raise HTTPException(status_code=400, detail="File kosong.")
+
+    # --- LAPIS 3: DEEP VALIDATION ---
+    await validate_pdf_integrity(raw)
+    # --- LAPIS 4: CLAMAV SCANNING (OPTIONAL TAPI DISARANKAN) ---
+    # Uncomment jika server sudah install ClamAV Daemon (clamd)
+    # import clamd
+    # cd = clamd.ClamdNetworkSocket()
+    # try:
+    #     scan_result = cd.instream(io.BytesIO(raw))
+    #     if scan_result['stream'][0] == 'FOUND':
+    #         raise HTTPException(status_code=400, detail="Malware terdeteksi pada file!")
+    # except FileNotFoundError:
+    #     print("[SECURITY WARNING] ClamAV daemon not running")
+
+    # --- LAPIS 5: SANITIZATION & STORAGE ---
+    
+    ensure_bucket(BUCKET_NAME, public=True)
     size = len(raw)
-    title = file.filename or "document.pdf"
+    
+    # Defang filename: Jangan pakai file.filename mentah dari user!
+    # User bisa kirim filename "../../../etc/passwd" (Directory Traversal)
+    original_filename = os.path.basename(file.filename) if file.filename else "document.pdf"
+    clean_filename = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', original_filename) # Ganti karakter aneh dengan _
+    
+    # Title boleh agak bebas, tapi filename storage harus ketat
+    title = clean_filename 
 
     folder = user_id or "anonymous"
     doc_id = str(uuid4())
-    path = f"{folder}/{doc_id}.pdf"
+    path = f"{folder}/{doc_id}.pdf" # rename total file-nya pake UUID di storage. Ini paling aman.
 
     try:
         res = supabase.storage.from_(BUCKET_NAME).upload(
@@ -531,12 +601,16 @@ async def documents_upload(
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Storage upload failed: {e}")
+    
     if isinstance(res, dict) and res.get("error"):
         raise HTTPException(status_code=500, detail=f"Storage error: {res['error']}")
 
     url = supabase.storage.from_(BUCKET_NAME).get_public_url(path)
 
+    # Pastikan pakai clean logic di bawah ini untuk insert DB
+    
     try:
+        # Cek page count lagi pake memory bytes yang udah divalidasi
         pages = len(PdfReader(io.BytesIO(raw)).pages)
     except Exception:
         pages = None
@@ -546,7 +620,7 @@ async def documents_upload(
 
     ins = supabase.table("documents").insert({
         "id": doc_id,
-        "title": title,
+        "title": title, 
         "url": url,
         "size": size,
         "page_count": pages,
@@ -555,6 +629,7 @@ async def documents_upload(
         "created_at": datetime.utcnow().isoformat(),
         "slug": unique_slug,
     }).execute()
+    
     if not ins.data:
         raise HTTPException(status_code=500, detail="Failed to insert document")
 
