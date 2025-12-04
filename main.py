@@ -504,38 +504,30 @@ def auth_login(req: LoginIn):
 #        DOCUMENTS + PIPELINE
 # =====================================
 async def validate_pdf_integrity(file_content: bytes):
-    """
-    Validasi brutal:
-    1. Cek Magic Number (%PDF).
-    2. Cek Indikasi Javascript Berbahaya (Regex bytes).
-    3. Coba baca strukturnya pake PdfReader.
-    """
     # 1. Magic Number Check
     if not file_content.startswith(b"%PDF"):
         raise HTTPException(status_code=400, detail="File corrupt: Header file bukan PDF asli.")
 
     # 2. Basic Malicious Script Detection (Byte-level scan)
-    # PDF bisa mengandung JS action yang otomatis jalan pas dibuka. 
-    # reject kalau ada keyword mencurigakan.
-    # Pattern: /JS, /JavaScript, /AA (Additional Actions), /OpenAction
     suspicious_patterns = [
         rb"/JS\s", rb"/JavaScript", rb"/AA\s", rb"/OpenAction"
     ]
     for pattern in suspicious_patterns:
         if re.search(pattern, file_content):
-             print(f"[SECURITY] Suspicious PDF pattern found: {pattern}", flush=True)
-             pass 
+             print(f"[SECURITY ALERT] Rejected malicious PDF pattern: {pattern}", flush=True)
+             raise HTTPException(
+                 status_code=400, 
+                 detail="SECURITY ALERT: File ditolak karena mengandung potensi script berbahaya (Javascript/Action)."
+             )
 
     # 3. Structure Check
     try:
         with io.BytesIO(file_content) as f:
             reader = PdfReader(f)
-            # Trigger parsing metadata basic
             if len(reader.pages) == 0:
                  raise HTTPException(status_code=400, detail="File PDF kosong atau tidak terbaca.")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"File corrupt: Gagal memparsing struktur PDF. {str(e)}")
-
 @app.post("/documents/upload")
 async def documents_upload(
     file: UploadFile = File(...),
