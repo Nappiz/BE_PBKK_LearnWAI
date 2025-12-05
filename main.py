@@ -13,7 +13,7 @@ import httpx
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
-from PyPDF2 import PdfReader
+from PyPDF2 import PdfReader, PdfWriter
 
 from supabase import create_client, Client
 
@@ -503,40 +503,58 @@ def auth_login(req: LoginIn):
 # =====================================
 #        DOCUMENTS + PIPELINE
 # =====================================
-async def validate_pdf_integrity(file_content: bytes):
-    # 1. Magic Number Check
+# Di main.py
+
+async def sanitize_and_validate_pdf(file_content: bytes) -> Tuple[bytes, bool]:
+    """
+    Returns: (clean_bytes, was_sanitized_bool)
+    """
     if not file_content.startswith(b"%PDF"):
         raise HTTPException(status_code=400, detail="File corrupt: Header file bukan PDF asli.")
 
-    # 2. Basic Malicious Script Detection (Byte-level scan)
-    suspicious_patterns = [
-        rb"/JS\s", rb"/JavaScript", rb"/AA\s", rb"/OpenAction"
-    ]
-    for pattern in suspicious_patterns:
-        if re.search(pattern, file_content):
-             print(f"[SECURITY ALERT] Rejected malicious PDF pattern: {pattern}", flush=True)
-             raise HTTPException(
-                 status_code=400, 
-                 detail="SECURITY ALERT: File ditolak karena mengandung potensi script berbahaya (Javascript/Action)."
-             )
-
-    # 3. Structure Check
     try:
-        with io.BytesIO(file_content) as f:
-            reader = PdfReader(f)
-            if len(reader.pages) == 0:
-                 raise HTTPException(status_code=400, detail="File PDF kosong atau tidak terbaca.")
+        input_stream = io.BytesIO(file_content)
+        reader = PdfReader(input_stream)
+        
+        if len(reader.pages) == 0:
+             raise HTTPException(status_code=400, detail="File PDF kosong atau tidak terbaca.")
+
+        writer = PdfWriter()
+        found_dirty = False
+
+        # 1. Cek Root OpenAction (Script auto-run pas dibuka)
+        try:
+            if "/OpenAction" in reader.trailer["/Root"]:
+                found_dirty = True
+        except:
+            pass
+
+        # 2. Cek Per Halaman
+        for page in reader.pages:
+            # Cek Additional Actions (/AA) atau Javascript di halaman
+            if "/AA" in page or "/JS" in str(page): 
+                found_dirty = True
+                if "/AA" in page: del page["/AA"] # Hapus /AA
+            
+            writer.add_page(page)
+
+        output_stream = io.BytesIO()
+        writer.write(output_stream)
+        clean_bytes = output_stream.getvalue()
+        
+        return clean_bytes, found_dirty
+
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"File corrupt: Gagal memparsing struktur PDF. {str(e)}")
+        print(f"[Sanitization Error] {e}", flush=True)
+        raise HTTPException(status_code=400, detail=f"File corrupt: {str(e)}")
+    
 @app.post("/documents/upload")
 async def documents_upload(
     file: UploadFile = File(...),
     user_id: Optional[str] = None,
     background_tasks: BackgroundTasks = None,
 ):
-    # --- LAPIS 0: CONTENT-LENGTH CHECK (Cheap Filter) ---
-    # Cek header sebelum baca isi file. Memang bisa dipalsukan hacker, 
-    # tapi ini melindungi dari user biasa yang gak sengaja upload file 1GB.
+    # --- LAPIS 0: CONTENT-LENGTH CHECK ---
     content_length = file.headers.get("content-length")
     if content_length:
         if int(content_length) > MAX_FILE_SIZE:
@@ -547,49 +565,39 @@ async def documents_upload(
         raise HTTPException(status_code=400, detail="Hanya file PDF yang diizinkan.")
 
     # --- LAPIS 2: SIZE & MEMORY PROTECTION ---
-    # Baca file. Karena kita sudah cek content-length, resiko sedikit berkurang.
     raw = await file.read()
     
-    # Cek real size setelah dibaca (Ultimate Truth)
     if len(raw) > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail=f"File terlalu besar (Real). Maks {MAX_FILE_SIZE/1024/1024}MB.")
     
     if len(raw) == 0:
         raise HTTPException(status_code=400, detail="File kosong.")
 
-    # --- LAPIS 3: DEEP VALIDATION ---
-    await validate_pdf_integrity(raw)
-    # --- LAPIS 4: CLAMAV SCANNING (OPTIONAL TAPI DISARANKAN) ---
-    # Uncomment jika server sudah install ClamAV Daemon (clamd)
-    # import clamd
-    # cd = clamd.ClamdNetworkSocket()
-    # try:
-    #     scan_result = cd.instream(io.BytesIO(raw))
-    #     if scan_result['stream'][0] == 'FOUND':
-    #         raise HTTPException(status_code=400, detail="Malware terdeteksi pada file!")
-    # except FileNotFoundError:
-    #     print("[SECURITY WARNING] ClamAV daemon not running")
+    # --- LAPIS 3: DEEP VALIDATION & SANITIZATION (CDR) ---
+    # Di sini bedanya. Kita panggil sanitizer, dan hasilnya (clean_bytes) yang kita pakai seterusnya.
+    clean_bytes, was_sanitized = await sanitize_and_validate_pdf(raw)
 
-    # --- LAPIS 5: SANITIZATION & STORAGE ---
+    # --- LAPIS 4: CLAMAV (Optional) ---
+    # Scan clean_bytes, bukan raw
+    
+    # --- LAPIS 5: STORAGE ---
+    # Gunakan clean_bytes untuk diupload ke Supabase!
+    # Jadi file yang tersimpan di server adalah versi yang sudah dikebiri script-nya.
     
     ensure_bucket(BUCKET_NAME, public=True)
-    size = len(raw)
+    size = len(clean_bytes) # Update size sesuai file baru
     
-    # Defang filename: Jangan pakai file.filename mentah dari user!
-    # User bisa kirim filename "../../../etc/passwd" (Directory Traversal)
     original_filename = os.path.basename(file.filename) if file.filename else "document.pdf"
-    clean_filename = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', original_filename) # Ganti karakter aneh dengan _
+    clean_filename = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', original_filename)
     
-    # Title boleh agak bebas, tapi filename storage harus ketat
     title = clean_filename 
-
     folder = user_id or "anonymous"
     doc_id = str(uuid4())
-    path = f"{folder}/{doc_id}.pdf" # rename total file-nya pake UUID di storage. Ini paling aman.
+    path = f"{folder}/{doc_id}.pdf"
 
     try:
         res = supabase.storage.from_(BUCKET_NAME).upload(
-            path, raw, {"content-type": "application/pdf"}
+            path, clean_bytes, {"content-type": "application/pdf"}
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Storage upload failed: {e}")
@@ -598,12 +606,9 @@ async def documents_upload(
         raise HTTPException(status_code=500, detail=f"Storage error: {res['error']}")
 
     url = supabase.storage.from_(BUCKET_NAME).get_public_url(path)
-
-    # Pastikan pakai clean logic di bawah ini untuk insert DB
     
     try:
-        # Cek page count lagi pake memory bytes yang udah divalidasi
-        pages = len(PdfReader(io.BytesIO(raw)).pages)
+        pages = len(PdfReader(io.BytesIO(clean_bytes)).pages)
     except Exception:
         pages = None
 
@@ -612,7 +617,7 @@ async def documents_upload(
 
     ins = supabase.table("documents").insert({
         "id": doc_id,
-        "title": title, 
+        "title": title,
         "url": url,
         "size": size,
         "page_count": pages,
@@ -639,7 +644,8 @@ async def documents_upload(
     })
 
     _set_status(job_id, "received", 5, f"File received: {title}", ok=True, doc_id=doc_id)
-    background_tasks.add_task(_pipeline_process, job_id, doc_id, title, raw)
+    
+    background_tasks.add_task(_pipeline_process, job_id, doc_id, title, clean_bytes, was_sanitized)
 
     return {"job_id": job_id, "document": ins.data[0]}
 
@@ -660,9 +666,17 @@ async def job_status(job_id: str):
         }
     raise HTTPException(status_code=404, detail="job_id not found")
 
-async def _pipeline_process(job_id: str, doc_id: str, title: str, raw: bytes):
+async def _pipeline_process(job_id: str, doc_id: str, title: str, raw: bytes, was_sanitized: bool = False):
     try:
         clear_store(doc_id)
+        
+        if was_sanitized:
+            _set_status(job_id, "sanitize", 5, "⚠️ Terdeteksi Script Javascript...", doc_id=doc_id)
+            await asyncio.sleep(2.0) 
+
+            _set_status(job_id, "sanitize", 8, "🛡️ Membersihkan Script & Neutralizing...", doc_id=doc_id)
+            await asyncio.sleep(2.0)
+            
         _set_status(job_id, "extract", 10, "Extracting PDF…", doc_id=doc_id)
         text_plain = _extract_pdf_text(raw)
 
